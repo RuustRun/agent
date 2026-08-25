@@ -1,0 +1,55 @@
+# Build the Ruust agent for linux amd64 and arm64 and publish the binaries to a
+# GitHub Release. The control plane serves whichever release it is pinned to, so a
+# fleet only updates when a new version is deliberately released here.
+#
+# Trigger by pushing a tag (v*), or run manually with a version. British English.
+# No em dashes.
+
+name: Release agent binaries
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to stamp (for example v0.1.0)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Resolve version
+        id: v
+        run: |
+          VER="${GITHUB_REF_NAME}"
+          if [ -z "${VER}" ] || [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            VER="${{ github.event.inputs.version }}"
+          fi
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Build static binaries
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
+              -ldflags "-s -w -X main.agentVersion=${{ steps.v.outputs.version }}" \
+              -o "dist/ruust-agent-linux-$arch" ./cmd/agent
+          done
+          ls -l dist
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/ruust-agent-linux-*

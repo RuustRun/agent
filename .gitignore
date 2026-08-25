@@ -1,0 +1,5 @@
+/dist/
+ruust-agent
+ruust-agent-linux-*
+*.exe
+.DS_Store

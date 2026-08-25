@@ -1,0 +1,44 @@
+# systemd unit for the Ruust host agent.
+#
+# Install to /etc/systemd/system/ruust-agent.service, drop the binary at
+# /usr/local/bin/ruust-agent, write the host token to /etc/ruust/host.token
+# (mode 0600, owned by root) and the environment to /etc/ruust/agent.env, then:
+#
+#   systemctl daemon-reload
+#   systemctl enable --now ruust-agent
+#
+# The agent needs no inbound ports. It keeps the host's containers running even
+# when the control plane is down, so a control-plane outage must never stop this
+# service.
+
+[Unit]
+Description=Ruust host agent (The Night Project)
+Documentation=https://github.com/thenightproject/ruust
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+# Configuration. RUUST_HOST_TOKEN_FILE defaults to /etc/ruust/host.token, so it
+# does not need to be set here.
+EnvironmentFile=/etc/ruust/agent.env
+ExecStart=/usr/local/bin/ruust-agent
+Restart=always
+RestartSec=5s
+
+# Keep restarting forever: a control plane outage must not stop the agent.
+StartLimitIntervalSec=0
+
+# Hardening. The agent needs the Docker socket and to read cgroup v2 stats under
+# /sys/fs/cgroup, but nothing else, so we lock the rest down.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/sys/fs/cgroup
+# The token file lives here; keep it readable but the tree otherwise protected.
+ReadOnlyPaths=/etc/ruust
+
+[Install]
+WantedBy=multi-user.target
