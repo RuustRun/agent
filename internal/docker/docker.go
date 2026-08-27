@@ -23,10 +23,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -62,6 +64,11 @@ const (
 	LabelVersion = LabelPrefix + ".version"
 	// LabelImageRef carries the image reference this container was created for.
 	LabelImageRef = LabelPrefix + ".imageref"
+	// LabelPort carries the port the app is expected to listen on, so the health
+	// probe knows where to connect.
+	LabelPort = LabelPrefix + ".port"
+	// LabelHealthPath carries the HTTP path the health probe requests.
+	LabelHealthPath = LabelPrefix + ".healthpath"
 )
 
 // EggNetwork is the shared bridge every Egg container joins. Inter-container
@@ -199,8 +206,14 @@ func (e *engineClient) List(ctx context.Context) ([]Container, error) {
 		// the summary-derived fields.
 		if info, ierr := e.cli.ContainerInspect(ctx, s.ID); ierr == nil {
 			c.RestartCount = info.RestartCount
-			c.Healthy = isHealthy(info)
 			c.State = mapInspectState(info)
+			c.Healthy = e.probeHealth(ctx, info)
+			// Up in Docker but not yet answering its health probe (still booting,
+			// or bound to the wrong interface): report it as still hatching, not
+			// hatched, so the Egg only goes live once it actually serves.
+			if c.State == contract.StateRunning && !c.Healthy {
+				c.State = contract.StateStarting
+			}
 			c.CgroupPath = cgroupPathFor(info)
 		}
 		out = append(out, c)
@@ -371,6 +384,9 @@ func (e *engineClient) Create(ctx context.Context, spec contract.WorkloadSpec, v
 		LabelEggID:      spec.EggID,
 		LabelImageRef:   spec.ImageRef,
 		LabelVersion:    version,
+		// Recorded so the periodic health probe knows where and what to request.
+		LabelPort:       strconv.Itoa(spec.Port),
+		LabelHealthPath: spec.HealthCheckPath,
 	}
 
 	// Env values are injected out of band: the agent fetched them from the secrets
@@ -640,8 +656,11 @@ func (e *engineClient) toContainer(ctx context.Context, id string) Container {
 			c.SpecVersion = info.Config.Labels[LabelVersion]
 		}
 		c.RestartCount = info.RestartCount
-		c.Healthy = isHealthy(info)
 		c.State = mapInspectState(info)
+		c.Healthy = e.probeHealth(ctx, info)
+		if c.State == contract.StateRunning && !c.Healthy {
+			c.State = contract.StateStarting
+		}
 		c.CgroupPath = cgroupPathFor(info)
 	}
 	return c
@@ -687,8 +706,60 @@ func mapInspectState(info types.ContainerJSON) contract.ContainerState {
 	}
 }
 
+// probeHealth reports whether a running container is actually accepting
+// connections on the port the ingress routes to. It dials the container by its
+// address on the host bridge, NOT via loopback, so an app that binds only to
+// 127.0.0.1 inside the container is correctly seen as unhealthy: the ingress
+// cannot reach it either. A plain TCP connect works for every Egg, a web server
+// or a database alike, because it only asks "is something listening there". When
+// the port or the container IP cannot be determined we fall back to the Docker
+// health check, so this never makes a container look worse than before.
+func (e *engineClient) probeHealth(ctx context.Context, info types.ContainerJSON) bool {
+	if info.State == nil || !info.State.Running {
+		return false
+	}
+	var labels map[string]string
+	if info.Config != nil {
+		labels = info.Config.Labels
+	}
+	port := labels[LabelPort]
+	ip := containerIP(info)
+	if port == "" || port == "0" || ip == "" {
+		return isHealthy(info) // nothing to probe against; keep prior behaviour
+	}
+	return probeTCP(ctx, net.JoinHostPort(ip, port))
+}
+
+// probeTCP dials addr and reports whether something is listening. A refused
+// connection (the localhost-bind case the docs describe) or a timeout is
+// unhealthy.
+func probeTCP(ctx context.Context, addr string) bool {
+	d := net.Dialer{Timeout: 3 * time.Second}
+	conn, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+// containerIP returns the container's IP on the first network that has one, so
+// the agent (on the host) can reach it over the bridge.
+func containerIP(info types.ContainerJSON) string {
+	if info.NetworkSettings == nil {
+		return ""
+	}
+	for _, n := range info.NetworkSettings.Networks {
+		if n != nil && n.IPAddress != "" {
+			return n.IPAddress
+		}
+	}
+	return info.NetworkSettings.IPAddress
+}
+
 // isHealthy reads the Docker health check result if one is configured. With no
-// health check configured, a running container is treated as healthy.
+// health check configured, a running container is treated as healthy. Used as the
+// fallback when an agent-side HTTP probe cannot be performed.
 func isHealthy(info types.ContainerJSON) bool {
 	if info.State == nil {
 		return false
