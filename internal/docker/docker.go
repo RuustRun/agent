@@ -71,6 +71,21 @@ const (
 	LabelHealthPath = LabelPrefix + ".healthpath"
 )
 
+// coopInternalSuffix is appended to an Egg's alias to give the documented
+// <name>.coop.internal private hostname, alongside the bare name.
+const coopInternalSuffix = ".coop.internal"
+
+// networkAliases returns the DNS names a peered sibling can reach this Egg at on
+// a shared private network: the bare Egg alias and the <name>.coop.internal form
+// the docs describe. Both resolve to the same container. Returns nil for an empty
+// alias.
+func networkAliases(alias string) []string {
+	if alias == "" {
+		return nil
+	}
+	return []string{alias, alias + coopInternalSuffix}
+}
+
 // EggNetwork is the shared bridge every Egg container joins. Inter-container
 // communication is disabled on it (enable_icc=false), so two Eggs co-located on
 // the same host cannot reach each other over the internal network, whilst each
@@ -472,7 +487,7 @@ func (e *engineClient) Create(ctx context.Context, spec contract.WorkloadSpec, v
 	if useLegacyNet && spec.InternalAlias != "" {
 		netConfig = &network.NetworkingConfig{
 			EndpointsConfig: map[string]*network.EndpointSettings{
-				netName: {Aliases: []string{spec.InternalAlias}},
+				netName: {Aliases: networkAliases(spec.InternalAlias)},
 			},
 		}
 	}
@@ -497,7 +512,9 @@ func (e *engineClient) Create(ctx context.Context, spec contract.WorkloadSpec, v
 		}
 		endpoint := &network.EndpointSettings{}
 		if att.Alias != "" {
-			endpoint.Aliases = []string{att.Alias}
+			// Reachable at the bare Egg name and the documented
+			// <name>.coop.internal form; both resolve to this container.
+			endpoint.Aliases = networkAliases(att.Alias)
 		}
 		if err := e.cli.NetworkConnect(ctx, att.Name, created.ID, endpoint); err != nil &&
 			!strings.Contains(strings.ToLower(err.Error()), "already exists") {
