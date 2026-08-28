@@ -370,6 +370,15 @@ func (e *engineClient) Create(ctx context.Context, spec contract.WorkloadSpec, v
 		return Container{}, err
 	}
 
+	// Release phase: run the Procfile release command once (e.g. migrations) with
+	// this image, env and private networks, BEFORE the workload rolls, and abort the
+	// roll if it fails, so new code never serves against an unmigrated database.
+	if spec.ReleaseCommand != "" {
+		if err := e.runRelease(ctx, spec); err != nil {
+			return Container{}, fmt.Errorf("release command failed for workload %q: %w", spec.ID, err)
+		}
+	}
+
 	// Base network: the shared, inter-container-isolated Egg bridge. Private
 	// reachability comes only from the explicit peer networks joined after create,
 	// so an Egg on the base bridge alone can reach no sibling. The deprecated
@@ -527,6 +536,79 @@ func (e *engineClient) Create(ctx context.Context, spec contract.WorkloadSpec, v
 		return Container{}, fmt.Errorf("starting container for workload %q: %w", spec.ID, err)
 	}
 	return e.toContainer(ctx, created.ID), nil
+}
+
+// runRelease runs the workload's release command once as a short-lived container,
+// with the same image, env and private networks as the workload, and returns an
+// error if it exits non-zero. The container is always removed and is deliberately
+// NOT labelled as a managed workload, so reconcile never adopts it.
+func (e *engineClient) runRelease(ctx context.Context, spec contract.WorkloadSpec) error {
+	env := spec.EnvValues
+	if spec.Port > 0 {
+		env = append(append([]string{}, spec.EnvValues...), fmt.Sprintf("PORT=%d", spec.Port))
+	}
+	name := fmt.Sprintf("ruust-release-%s-%d", strings.ToLower(spec.ID), time.Now().UnixNano())
+	config := &container.Config{
+		Image:  spec.ImageRef,
+		Env:    env,
+		Cmd:    []string{"sh", "-c", spec.ReleaseCommand},
+		Labels: map[string]string{LabelPrefix + ".release": spec.ID},
+	}
+
+	// Join the base Egg bridge (so it resolves) plus the peer networks below, so the
+	// release can reach the Egg's database over private networking.
+	netName := EggNetwork
+	if len(spec.Networks) == 0 && spec.NetworkName != "" {
+		netName = spec.NetworkName
+		if err := e.ensurePrivateNetwork(ctx, netName); err != nil {
+			return err
+		}
+	} else if err := e.ensureEggNetwork(ctx); err != nil {
+		return err
+	}
+	hostConfig := &container.HostConfig{
+		NetworkMode:   container.NetworkMode(netName),
+		RestartPolicy: container.RestartPolicy{Name: container.RestartPolicyDisabled},
+	}
+
+	created, err := e.cli.ContainerCreate(ctx, config, hostConfig, nil, nil, name)
+	if err != nil {
+		return fmt.Errorf("creating release container: %w", err)
+	}
+	defer func() { _ = e.cli.ContainerRemove(ctx, created.ID, container.RemoveOptions{Force: true}) }()
+
+	for _, att := range spec.Networks {
+		if att.Name == "" {
+			continue
+		}
+		if err := e.ensurePrivateNetwork(ctx, att.Name); err != nil {
+			return err
+		}
+		if err := e.cli.NetworkConnect(ctx, att.Name, created.ID, &network.EndpointSettings{}); err != nil &&
+			!strings.Contains(strings.ToLower(err.Error()), "already exists") {
+			return fmt.Errorf("connecting release container to %q: %w", att.Name, err)
+		}
+	}
+
+	if err := e.cli.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
+		return fmt.Errorf("starting release container: %w", err)
+	}
+
+	statusCh, errCh := e.cli.ContainerWait(ctx, created.ID, container.WaitConditionNotRunning)
+	select {
+	case werr := <-errCh:
+		if werr != nil {
+			return fmt.Errorf("waiting for release container: %w", werr)
+		}
+		return nil
+	case st := <-statusCh:
+		if st.StatusCode != 0 {
+			return fmt.Errorf("release command exited with code %d", st.StatusCode)
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (e *engineClient) Stop(ctx context.Context, id string) error {

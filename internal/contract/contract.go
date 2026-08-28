@@ -225,6 +225,11 @@ type WorkloadSpec struct {
 	Env []string `json:"env"`
 	// HealthCheckPath is the HTTP path polled for health checks.
 	HealthCheckPath string `json:"healthCheckPath"`
+	// ReleaseCommand is an optional command from the repo Procfile's release: line
+	// (e.g. "bin/rails db:migrate"). The agent runs it once as a one-shot container
+	// with this deployment's image, env and private networks BEFORE rolling the
+	// workload, and gates the roll on its success. Empty means no release step.
+	ReleaseCommand string `json:"releaseCommand,omitempty"`
 	// Revision is an opaque deployment revision. It changes on redeploy, which
 	// changes the desired-state version and rolls the container even when the
 	// image is unchanged. The agent does not interpret it.
