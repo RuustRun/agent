@@ -22,8 +22,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
@@ -906,14 +908,17 @@ func mapInspectState(info types.ContainerJSON) contract.ContainerState {
 	}
 }
 
-// probeHealth reports whether a running container is actually accepting
-// connections on the port the ingress routes to. It dials the container by its
-// address on the host bridge, NOT via loopback, so an app that binds only to
-// 127.0.0.1 inside the container is correctly seen as unhealthy: the ingress
-// cannot reach it either. A plain TCP connect works for every Egg, a web server
-// or a database alike, because it only asks "is something listening there". When
-// the port or the container IP cannot be determined we fall back to the Docker
-// health check, so this never makes a container look worse than before.
+// probeHealth reports whether a running container is actually serving. A web Egg
+// (one with a published host port) gets a real HTTP GET against its health-check
+// path: only a 2xx or 3xx response is healthy, so an app that accepts the port but
+// is still warming up, erroring (5xx) or serving the wrong path (4xx) is correctly
+// held out of "hatched" and out of ingress. A database Egg (no published port,
+// reached only over its private network on a raw wire protocol) gets a plain TCP
+// connect instead, since it speaks no HTTP. The published port is probed on
+// loopback, which is reachable whether or not the host can route to container
+// bridge IPs (it cannot on Docker Desktop) and is exactly the path traffic takes;
+// it still fails for an app bound only to the container's loopback, because Docker
+// forwards a published port to the container's bridge interface, not its 127.0.0.1.
 func (e *engineClient) probeHealth(ctx context.Context, info types.ContainerJSON) bool {
 	if info.State == nil || !info.State.Running {
 		return false
@@ -922,19 +927,16 @@ func (e *engineClient) probeHealth(ctx context.Context, info types.ContainerJSON
 	if info.Config != nil {
 		labels = info.Config.Labels
 	}
-	// Prefer the published host port when the container has one. It is reachable
-	// whether or not the host can route to container bridge IPs (it cannot on Docker
-	// Desktop, so a bridge-IP probe always fails locally), and it is exactly the path
-	// ingress uses, so a passing probe means the Egg is reachable the way traffic
-	// actually reaches it. It still fails for an app bound only to the container's
-	// loopback, since Docker forwards a published port to the container's bridge
-	// interface, not its 127.0.0.1, so the localhost-bind check still holds.
 	if hp := publishedPortFrom(info); hp > 0 {
 		host := e.publishHost
 		if host == "" || host == "0.0.0.0" {
 			host = "127.0.0.1"
 		}
-		return probeTCP(ctx, net.JoinHostPort(host, strconv.Itoa(hp)))
+		path := labels[LabelHealthPath]
+		if path == "" {
+			path = "/"
+		}
+		return probeHTTP(ctx, host, hp, path)
 	}
 	// No published port (e.g. a database Egg reached only over its private network):
 	// probe the container on its bridge address, which the agent can reach on a real
@@ -945,6 +947,35 @@ func (e *engineClient) probeHealth(ctx context.Context, info types.ContainerJSON
 		return isHealthy(info) // nothing to probe against; keep prior behaviour
 	}
 	return probeTCP(ctx, net.JoinHostPort(ip, port))
+}
+
+// probeHTTP issues a GET to the health-check path and reports healthy for a 2xx or
+// 3xx response. A connection refused, a timeout, or a 4xx/5xx status is unhealthy,
+// so the Egg only goes live once the app actually serves that path successfully.
+func probeHTTP(ctx context.Context, host string, port int, path string) bool {
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	url := fmt.Sprintf("http://%s:%d%s", host, port, path)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false
+	}
+	client := &http.Client{
+		Timeout: 3 * time.Second,
+		// A redirect is a healthy response in its own right (the server answered);
+		// do not follow it, just read the status.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
+	}()
+	return resp.StatusCode >= 200 && resp.StatusCode < 400
 }
 
 // probeTCP dials addr and reports whether something is listening. A refused
