@@ -38,6 +38,7 @@ import (
 	"log/slog"
 	"math/big"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -617,6 +618,24 @@ func (a *agent) authorise(req *http.Request) {
 	req.Header.Set("User-Agent", "ruust-agent/"+agentVersion)
 }
 
+// requireSecureURL rejects a control-plane URL that is not https, unless it points
+// at localhost or an explicit opt-out (RUUST_ALLOW_INSECURE_CP=1) is set. The
+// control plane is the agent's root of trust, so a remote http URL is refused.
+func requireSecureURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("RUUST_CONTROL_PLANE_URL is not a valid URL: %w", err)
+	}
+	if u.Scheme == "https" {
+		return nil
+	}
+	host := u.Hostname()
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" || os.Getenv("RUUST_ALLOW_INSECURE_CP") == "1" {
+		return nil
+	}
+	return fmt.Errorf("RUUST_CONTROL_PLANE_URL must be https (got scheme %q)", u.Scheme)
+}
+
 // loadConfig resolves configuration from the environment and reads the host
 // token from disk when a file path is given.
 func loadConfig() (config, error) {
@@ -637,6 +656,12 @@ func loadConfig() (config, error) {
 
 	if cfg.controlPlaneURL == "" {
 		return config{}, fmt.Errorf("RUUST_CONTROL_PLANE_URL is required")
+	}
+	// The control plane is the root of trust for self-update and everything else
+	// the agent fetches, so require https. Allow http only for a localhost dev
+	// control plane, or an explicit opt-out, never for a remote host.
+	if err := requireSecureURL(cfg.controlPlaneURL); err != nil {
+		return config{}, err
 	}
 	if cfg.hostID == "" {
 		return config{}, fmt.Errorf("RUUST_HOST_ID is required")
