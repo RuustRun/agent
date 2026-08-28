@@ -69,13 +69,16 @@ jobs:
           echo "version=${next}" >> "$GITHUB_OUTPUT"
           echo "Releasing ${next} (previous: ${latest:-none})"
 
-      - name: Build static binaries
+      - name: Build static binaries and checksums
         run: |
           mkdir -p dist
           for arch in amd64 arm64; do
             CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
               -ldflags "-s -w -X main.agentVersion=${{ steps.v.outputs.version }}" \
               -o "dist/ruust-agent-linux-$arch" ./cmd/agent
+            # Publish a bare sha256 next to each binary. The agent fetches it and
+            # verifies the download before it will install and exec the new build.
+            sha256sum "dist/ruust-agent-linux-$arch" | awk '{print $1}' > "dist/ruust-agent-linux-$arch.sha256"
           done
           ls -l dist
 

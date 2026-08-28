@@ -30,6 +30,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -271,6 +273,16 @@ func (a *agent) maybeSelfUpdate(ctx context.Context) {
 		return
 	}
 
+	// Integrity: fetch the published sha256 for this build and verify the download
+	// against it before we ever chmod +x and swap it into place. Fail closed: no
+	// verified checksum, no update, so a tampered or corrupt binary is never exec'd
+	// as root. (Stronger provenance, a signature, is a follow-up on top of this.)
+	expected, cerr := a.fetchChecksum(ctx, url+".sha256")
+	if cerr != nil {
+		a.log.Warn("self-update: could not verify checksum, skipping update", "err", cerr)
+		return
+	}
+
 	// Write to a temp file in the SAME directory so the rename is atomic on one
 	// filesystem, then swap it into place over the running binary (allowed on Linux
 	// even while executing: the open handle keeps the old inode until exit).
@@ -280,13 +292,20 @@ func (a *agent) maybeSelfUpdate(ctx context.Context) {
 		return
 	}
 	tmpName := tmp.Name()
-	if _, err := io.Copy(tmp, res.Body); err != nil {
+	// Hash the bytes as they are written, so we never re-read the file to verify.
+	hash := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(tmp, hash), res.Body); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
 		a.log.Warn("self-update: write failed", "err", err)
 		return
 	}
 	_ = tmp.Close()
+	if got := hex.EncodeToString(hash.Sum(nil)); !strings.EqualFold(got, expected) {
+		_ = os.Remove(tmpName)
+		a.log.Warn("self-update: checksum mismatch, refusing to install", "expected", expected, "got", got)
+		return
+	}
 	if err := os.Chmod(tmpName, 0o755); err != nil {
 		_ = os.Remove(tmpName)
 		a.log.Warn("self-update: chmod failed", "err", err)
@@ -313,6 +332,47 @@ func (a *agent) maybeSelfUpdate(ctx context.Context) {
 
 	a.log.Info("agent updated, restarting into new build (on probation)", "version", target)
 	os.Exit(0) // systemd (Restart=always) brings it straight back on the new binary.
+}
+
+// fetchChecksum GETs a published sha256 file for the agent binary and returns its
+// hex digest. The body is a bare digest or "sha256sum" style ("<hex>  <name>").
+func (a *agent) fetchChecksum(ctx context.Context, url string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	res, err := a.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = res.Body.Close() }()
+	if res.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("checksum status %d", res.StatusCode)
+	}
+	b, err := io.ReadAll(io.LimitReader(res.Body, 4096))
+	if err != nil {
+		return "", err
+	}
+	return parseSha256(string(b))
+}
+
+// parseSha256 extracts a lower-case 64-hex-char sha256 digest from a checksum file
+// body, rejecting anything that is not exactly one.
+func parseSha256(s string) (string, error) {
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return "", fmt.Errorf("empty checksum")
+	}
+	sum := strings.ToLower(fields[0])
+	if len(sum) != 64 {
+		return "", fmt.Errorf("unexpected checksum length %d", len(sum))
+	}
+	for _, c := range sum {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return "", fmt.Errorf("non-hex checksum")
+		}
+	}
+	return sum, nil
 }
 
 // tick performs one poll-diff-converge-report cycle. It never returns an error:

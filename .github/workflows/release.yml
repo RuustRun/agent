@@ -38,13 +38,14 @@ jobs:
           fi
           echo "version=${VER}" >> "$GITHUB_OUTPUT"
 
-      - name: Build static binaries
+      - name: Build static binaries and checksums
         run: |
           mkdir -p dist
           for arch in amd64 arm64; do
             CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
               -ldflags "-s -w -X main.agentVersion=${{ steps.v.outputs.version }}" \
               -o "dist/ruust-agent-linux-$arch" ./cmd/agent
+            sha256sum "dist/ruust-agent-linux-$arch" | awk '{print $1}' > "dist/ruust-agent-linux-$arch.sha256"
           done
           ls -l dist
 
