@@ -424,17 +424,36 @@ func (a *agent) tick(ctx context.Context) {
 		a.appliedVersion = desired.Version
 	}
 
-	// Reconcile ingress: register a Caddy route for every running Egg that has a
-	// published port and at least one hostname, and refresh the ask allow-list. A
-	// failure here must not stop the workload loop; it is logged and retried.
-	routes := make([]ingress.Route, 0, len(desired.Workloads))
-	for _, w := range desired.Workloads {
-		if w.PublishPort > 0 && len(w.Hostnames) > 0 {
-			routes = append(routes, ingress.Route{Hostnames: w.Hostnames, UpstreamPort: w.PublishPort})
+	// Reconcile ingress: for every Egg that is published (a web Egg, PublishPort > 0)
+	// and has at least one hostname, register a Caddy route that load-balances across
+	// the host ports of its live replicas, and refresh the ask allow-list. Replicas
+	// bind ephemeral host ports the control plane does not know in advance, so we read
+	// the live ports back from Docker rather than trusting the spec. A failure here
+	// must not stop the workload loop; it is logged and retried.
+	actual, lerr := a.docker.List(ctx)
+	if lerr != nil {
+		a.log.Warn("could not list containers for ingress", "err", lerr)
+	} else {
+		portsByWorkload := make(map[string][]int)
+		for _, c := range actual {
+			// A replica whose host port is bound and which is up (running, or booting
+			// with a bound port) is an ingress upstream. Stopped and crashed replicas
+			// are excluded so traffic is not sent to a dead backend.
+			if c.PublishedPort > 0 && (c.State == contract.StateRunning || c.State == contract.StateStarting) {
+				portsByWorkload[c.WorkloadID] = append(portsByWorkload[c.WorkloadID], c.PublishedPort)
+			}
 		}
-	}
-	if err := a.ingress.Reconcile(ctx, routes); err != nil {
-		a.log.Warn("could not reconcile ingress", "err", err)
+		routes := make([]ingress.Route, 0, len(desired.Workloads))
+		for _, w := range desired.Workloads {
+			if w.PublishPort > 0 && len(w.Hostnames) > 0 {
+				if ports := portsByWorkload[w.ID]; len(ports) > 0 {
+					routes = append(routes, ingress.Route{Hostnames: w.Hostnames, UpstreamPorts: ports})
+				}
+			}
+		}
+		if err := a.ingress.Reconcile(ctx, routes); err != nil {
+			a.log.Warn("could not reconcile ingress", "err", err)
+		}
 	}
 
 	a.reportStatus(ctx, a.appliedVersion)

@@ -42,6 +42,10 @@ type Step struct {
 	BlobID string
 	// ContainerID is the target container, where one exists.
 	ContainerID string
+	// ReplicaIndex is the 0-based replica slot this step concerns. ActionStart uses
+	// it to name and label the new container; stop, roll and restart carry it for
+	// logging and idempotency.
+	ReplicaIndex int
 }
 
 // Plan is the ordered set of steps computed by Diff. Stops run before starts so
@@ -54,109 +58,99 @@ type Plan struct {
 // containers. It is pure: it performs no I/O and mutates nothing, which is what
 // makes it unit testable.
 //
-// Rules:
-//   - A desired workload with replicas >= 1 and no healthy up-to-date container
-//     is started (or rolled if a stale one exists).
-//   - A desired workload with replicas == 0 has any container stopped (the Egg
-//     goes cold on purpose).
+// Rules, per desired workload with Replicas = N:
+//   - Exactly N replica slots (indices 0..N-1) should each have one healthy,
+//     up-to-date container. A missing slot is started; a stale one is rolled; an
+//     unhealthy or crashed one is restarted in place.
+//   - A container at an index >= N (a scale-down), a duplicate for a slot already
+//     filled, or a legacy container from an agent that predates replica indexing,
+//     is surplus and stopped.
+//   - Replicas == 0 stops every container for the workload (the Egg goes cold on
+//     purpose).
 //   - A container with no matching desired workload is stopped (extra).
-//   - A container whose image or spec version differs from desired is rolled.
-//   - A crashed or unhealthy container for a still-desired workload is restarted.
 func Diff(desired contract.DesiredState, actual []docker.Container) Plan {
 	var plan Plan
 
-	// Index actual containers by workload id. In phase 1 replicas is effectively
-	// one container per workload; we take the first match and treat any surplus as
-	// extra so the invariant stays simple and idempotent.
-	byWorkload := make(map[string]docker.Container, len(actual))
-	seen := make(map[string]bool, len(actual))
-	for _, c := range actual {
-		if _, ok := byWorkload[c.WorkloadID]; ok {
-			// Surplus container for an already-matched workload: stop it.
-			plan.Steps = append(plan.Steps, Step{
-				Action:      ActionStop,
-				WorkloadID:  c.WorkloadID,
-				BlobID:      c.BlobID,
-				ContainerID: c.ID,
-			})
-			continue
-		}
-		byWorkload[c.WorkloadID] = c
-	}
-
 	desiredByID := make(map[string]contract.WorkloadSpec, len(desired.Workloads))
-
-	// First pass: stops and rolls (free resources before claiming them).
 	for _, w := range desired.Workloads {
 		desiredByID[w.ID] = w
-		c, running := byWorkload[w.ID]
-		if !running {
+	}
+
+	// Group observed containers by workload id, preserving listing order so the
+	// first container seen for a given replica slot is the one retained.
+	byWorkload := make(map[string][]docker.Container, len(actual))
+	for _, c := range actual {
+		byWorkload[c.WorkloadID] = append(byWorkload[c.WorkloadID], c)
+	}
+
+	stop := func(c docker.Container, action Action) Step {
+		return Step{Action: action, WorkloadID: c.WorkloadID, BlobID: c.BlobID, ContainerID: c.ID, ReplicaIndex: c.ReplicaIndex}
+	}
+
+	// First pass: stops and rolls (free resources before claiming them again).
+	// keepers[w.ID][idx] is the single container retained for that replica slot.
+	keepers := make(map[string]map[int]docker.Container, len(desired.Workloads))
+	for _, w := range desired.Workloads {
+		cs := byWorkload[w.ID]
+
+		// Desired cold: stop every container for this workload.
+		if w.Replicas <= 0 {
+			for _, c := range cs {
+				plan.Steps = append(plan.Steps, stop(c, ActionStop))
+			}
 			continue
 		}
-		seen[w.ID] = true
 
-		if w.Replicas == 0 {
-			// Desired cold: stop any running container.
-			plan.Steps = append(plan.Steps, Step{
-				Action:      ActionStop,
-				WorkloadID:  w.ID,
-				BlobID:      w.BlobID,
-				ContainerID: c.ID,
-			})
-			continue
+		keep := make(map[int]docker.Container, w.Replicas)
+		for _, c := range cs {
+			// Legacy (no replica label), an index beyond the desired count (scale
+			// down), or a duplicate for an already-filled slot: all surplus, stop.
+			if c.Legacy || c.ReplicaIndex < 0 || c.ReplicaIndex >= w.Replicas {
+				plan.Steps = append(plan.Steps, stop(c, ActionStop))
+				continue
+			}
+			if _, taken := keep[c.ReplicaIndex]; taken {
+				plan.Steps = append(plan.Steps, stop(c, ActionStop))
+				continue
+			}
+			keep[c.ReplicaIndex] = c
 		}
+		keepers[w.ID] = keep
 
-		if isStale(w, c, desired.Version) {
-			plan.Steps = append(plan.Steps, Step{
-				Action:      ActionRoll,
-				WorkloadID:  w.ID,
-				BlobID:      w.BlobID,
-				ContainerID: c.ID,
-			})
+		// Roll any kept-but-stale replica: stop it here, start the replacement below.
+		for idx := 0; idx < w.Replicas; idx++ {
+			if c, ok := keep[idx]; ok && isStale(w, c, desired.Version) {
+				plan.Steps = append(plan.Steps, stop(c, ActionRoll))
+			}
 		}
 	}
 
 	// Extra containers: any observed workload not in desired state at all.
 	for _, c := range actual {
 		if _, wanted := desiredByID[c.WorkloadID]; !wanted {
-			plan.Steps = append(plan.Steps, Step{
-				Action:      ActionStop,
-				WorkloadID:  c.WorkloadID,
-				BlobID:      c.BlobID,
-				ContainerID: c.ID,
-			})
+			plan.Steps = append(plan.Steps, stop(c, ActionStop))
 		}
 	}
 
-	// Second pass: starts and restarts.
+	// Second pass: starts and restarts, per replica slot.
 	for _, w := range desired.Workloads {
-		if w.Replicas == 0 {
+		if w.Replicas <= 0 {
 			continue
 		}
-		c, running := byWorkload[w.ID]
-		switch {
-		case !running:
-			// Missing: start it.
-			plan.Steps = append(plan.Steps, Step{
-				Action:     ActionStart,
-				WorkloadID: w.ID,
-				BlobID:     w.BlobID,
-			})
-		case isStale(w, c, desired.Version):
-			// Already scheduled a roll (stop) above; start the replacement.
-			plan.Steps = append(plan.Steps, Step{
-				Action:     ActionStart,
-				WorkloadID: w.ID,
-				BlobID:     w.BlobID,
-			})
-		case needsRestart(c):
-			// Present but unhealthy or crashed: restart in place.
-			plan.Steps = append(plan.Steps, Step{
-				Action:      ActionRestart,
-				WorkloadID:  w.ID,
-				BlobID:      w.BlobID,
-				ContainerID: c.ID,
-			})
+		keep := keepers[w.ID]
+		for idx := 0; idx < w.Replicas; idx++ {
+			c, present := keep[idx]
+			switch {
+			case !present:
+				// Missing slot: start it.
+				plan.Steps = append(plan.Steps, Step{Action: ActionStart, WorkloadID: w.ID, BlobID: w.BlobID, ReplicaIndex: idx})
+			case isStale(w, c, desired.Version):
+				// Already scheduled a roll (stop) above; start the replacement.
+				plan.Steps = append(plan.Steps, Step{Action: ActionStart, WorkloadID: w.ID, BlobID: w.BlobID, ReplicaIndex: idx})
+			case needsRestart(c):
+				// Present but unhealthy or crashed: restart in place.
+				plan.Steps = append(plan.Steps, Step{Action: ActionRestart, WorkloadID: w.ID, BlobID: w.BlobID, ContainerID: c.ID, ReplicaIndex: idx})
+			}
 		}
 	}
 
@@ -215,8 +209,8 @@ func Apply(ctx context.Context, cli docker.Client, desired contract.DesiredState
 			if !ok {
 				continue
 			}
-			if _, err := cli.Create(ctx, spec, desired.Version); err != nil {
-				errs = append(errs, fmt.Errorf("start %s: %w", step.WorkloadID, err))
+			if _, err := cli.Create(ctx, spec, desired.Version, step.ReplicaIndex); err != nil {
+				errs = append(errs, fmt.Errorf("start %s replica %d: %w", step.WorkloadID, step.ReplicaIndex, err))
 			}
 		case ActionRestart:
 			if step.ContainerID != "" {

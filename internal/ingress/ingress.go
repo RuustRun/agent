@@ -27,12 +27,14 @@ import (
 	"sync"
 )
 
-// Route is one Egg's ingress: the hostnames it serves and the host port its
-// container is published on. The upstream host (how Caddy reaches that port) is
-// configured on the Reconciler.
+// Route is one Egg's ingress: the hostnames it serves and the host ports its
+// replicas are published on. Caddy load-balances across all of an Egg's live
+// replica ports (round-robin by default), so a multi-replica Egg spreads traffic
+// and survives a single replica dying. The upstream host (how Caddy reaches those
+// ports) is configured on the Reconciler.
 type Route struct {
-	Hostnames    []string
-	UpstreamPort int
+	Hostnames     []string
+	UpstreamPorts []int
 }
 
 // Reconciler owns the connection to Caddy's admin API and the ask allow-list.
@@ -147,8 +149,23 @@ func (r *Reconciler) build(routes []Route) (map[string]any, map[string]bool) {
 	sort.Slice(sorted, func(i, j int) bool { return firstHost(sorted[i]) < firstHost(sorted[j]) })
 
 	for _, rt := range sorted {
-		if rt.UpstreamPort <= 0 || len(rt.Hostnames) == 0 {
+		if len(rt.Hostnames) == 0 {
 			continue
+		}
+		// One upstream per live replica port, sorted for a stable config hash.
+		ports := make([]int, 0, len(rt.UpstreamPorts))
+		for _, p := range rt.UpstreamPorts {
+			if p > 0 {
+				ports = append(ports, p)
+			}
+		}
+		if len(ports) == 0 {
+			continue
+		}
+		sort.Ints(ports)
+		upstreams := make([]map[string]any, 0, len(ports))
+		for _, p := range ports {
+			upstreams = append(upstreams, map[string]any{"dial": fmt.Sprintf("%s:%d", r.upstreamHost, p)})
 		}
 		hosts := append([]string(nil), rt.Hostnames...)
 		sort.Strings(hosts)
@@ -158,10 +175,8 @@ func (r *Reconciler) build(routes []Route) (map[string]any, map[string]bool) {
 		httpRoutes = append(httpRoutes, map[string]any{
 			"match": []map[string]any{{"host": hosts}},
 			"handle": []map[string]any{{
-				"handler": "reverse_proxy",
-				"upstreams": []map[string]any{
-					{"dial": fmt.Sprintf("%s:%d", r.upstreamHost, rt.UpstreamPort)},
-				},
+				"handler":   "reverse_proxy",
+				"upstreams": upstreams,
 			}},
 		})
 	}

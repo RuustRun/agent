@@ -69,6 +69,10 @@ const (
 	LabelPort = LabelPrefix + ".port"
 	// LabelHealthPath carries the HTTP path the health probe requests.
 	LabelHealthPath = LabelPrefix + ".healthpath"
+	// LabelReplica carries the 0-based replica index of this container within its
+	// workload, so a single Egg can run several load-balanced replicas, each in its
+	// own container with its own identity and (for web Eggs) its own host port.
+	LabelReplica = LabelPrefix + ".replica"
 )
 
 // coopInternalSuffix is appended to an Egg's alias to give the documented
@@ -126,6 +130,17 @@ type Container struct {
 	// CgroupPath is the absolute cgroup v2 path for this container, used to read
 	// resource stats directly.
 	CgroupPath string
+	// ReplicaIndex is the 0-based replica index within the workload. A workload
+	// running N replicas has containers with indices 0..N-1.
+	ReplicaIndex int
+	// PublishedPort is the host port this container's app port is published on (0
+	// when it is not published, e.g. a database Egg). Ingress load-balances across
+	// the published ports of a workload's live replicas.
+	PublishedPort int
+	// Legacy is true for a container created by an older agent that predates replica
+	// indexing (no replica label). It is always rolled so the fleet converges onto
+	// the indexed naming.
+	Legacy bool
 }
 
 // Client is the surface the reconcile loop depends on. It is deliberately
@@ -136,10 +151,10 @@ type Client interface {
 	List(ctx context.Context) ([]Container, error)
 	// EnsureImage pulls the image if it is not already present. Idempotent.
 	EnsureImage(ctx context.Context, imageRef string) error
-	// Create creates and starts a container for the given workload with hard
-	// limits on every axis. It is idempotent by workload identity: if a matching
-	// container already exists it is a no-op.
-	Create(ctx context.Context, spec contract.WorkloadSpec, version string) (Container, error)
+	// Create creates and starts the given replica of a workload with hard limits on
+	// every axis. It is idempotent by (workload, replica) identity: if a matching
+	// container already exists for this spec version it is a no-op.
+	Create(ctx context.Context, spec contract.WorkloadSpec, version string, replica int) (Container, error)
 	// Stop stops and removes the container with the given ID. Idempotent: a
 	// missing container is treated as success.
 	Stop(ctx context.Context, id string) error
@@ -191,8 +206,8 @@ func NewEngineClient() (Client, error) {
 
 // containerName builds a stable, idempotent container name from the workload
 // identity so repeated Create calls collide by name rather than duplicating.
-func containerName(workloadID string) string {
-	return "ruust-" + workloadID
+func containerName(workloadID string, replica int) string {
+	return fmt.Sprintf("ruust-%s-%d", workloadID, replica)
 }
 
 func (e *engineClient) List(ctx context.Context) ([]Container, error) {
@@ -206,19 +221,22 @@ func (e *engineClient) List(ctx context.Context) ([]Container, error) {
 
 	out := make([]Container, 0, len(summaries))
 	for _, s := range summaries {
+		replica, hasReplica := replicaFromLabels(s.Labels)
 		c := Container{
-			ID:          s.ID,
-			WorkloadID:  s.Labels[LabelWorkloadID],
-			BlobID:      s.Labels[LabelBlobID],
-			EggID:       s.Labels[LabelEggID],
-			ImageRef:    s.Labels[LabelImageRef],
-			SpecVersion: s.Labels[LabelVersion],
-			State:       mapState(s.State),
+			ID:           s.ID,
+			WorkloadID:   s.Labels[LabelWorkloadID],
+			BlobID:       s.Labels[LabelBlobID],
+			EggID:        s.Labels[LabelEggID],
+			ImageRef:     s.Labels[LabelImageRef],
+			SpecVersion:  s.Labels[LabelVersion],
+			State:        mapState(s.State),
+			ReplicaIndex: replica,
+			Legacy:       !hasReplica,
 		}
 
-		// Inspect for restart count, health and cgroup path. Inspection failing on
-		// a single container must not fail the whole reconcile, so we degrade to
-		// the summary-derived fields.
+		// Inspect for restart count, health, cgroup path and the published host port.
+		// Inspection failing on a single container must not fail the whole reconcile,
+		// so we degrade to the summary-derived fields.
 		if info, ierr := e.cli.ContainerInspect(ctx, s.ID); ierr == nil {
 			c.RestartCount = info.RestartCount
 			c.State = mapInspectState(info)
@@ -230,6 +248,7 @@ func (e *engineClient) List(ctx context.Context) ([]Container, error) {
 				c.State = contract.StateStarting
 			}
 			c.CgroupPath = cgroupPathFor(info)
+			c.PublishedPort = publishedPortFrom(info)
 		}
 		out = append(out, c)
 	}
@@ -352,8 +371,8 @@ func (e *engineClient) ensurePrivateNetwork(ctx context.Context, name string) er
 	return nil
 }
 
-func (e *engineClient) Create(ctx context.Context, spec contract.WorkloadSpec, version string) (Container, error) {
-	name := containerName(spec.ID)
+func (e *engineClient) Create(ctx context.Context, spec contract.WorkloadSpec, version string, replica int) (Container, error) {
+	name := containerName(spec.ID, replica)
 
 	// Idempotency: if a container with this name already exists for the same
 	// spec version, do nothing. If it exists for an older version, the caller
@@ -408,6 +427,7 @@ func (e *engineClient) Create(ctx context.Context, spec contract.WorkloadSpec, v
 		LabelEggID:      spec.EggID,
 		LabelImageRef:   spec.ImageRef,
 		LabelVersion:    version,
+		LabelReplica:    strconv.Itoa(replica),
 		// Recorded so the periodic health probe knows where and what to request.
 		LabelPort:       strconv.Itoa(spec.Port),
 		LabelHealthPath: spec.HealthCheckPath,
@@ -477,15 +497,21 @@ func (e *engineClient) Create(ctx context.Context, spec contract.WorkloadSpec, v
 		})
 	}
 
-	// Publish the container port to a host port when the desired state asks for
-	// it, so the local ingress (Caddy) can reach the Egg. The bind defaults to
-	// loopback (publishHost) so the Egg is never directly reachable on the host's
-	// public IP where it would bypass TLS and the ingress tier.
+	// Publish the container port to a host port when the desired state asks for it
+	// (PublishPort > 0 marks a web Egg; a database Egg has none), so the local
+	// ingress (Caddy) can reach the Egg. The host port is left for Docker to assign
+	// (an ephemeral port), NOT pinned to spec.PublishPort: several replicas of one
+	// Egg cannot share a single host port, and an ephemeral port also lets a new
+	// replica start alongside the old one during a zero-downtime roll. The agent
+	// reads the assigned port back from Docker and hands the live set to ingress.
+	// The bind defaults to loopback (publishHost) so the Egg is never directly
+	// reachable on the host's public IP where it would bypass TLS and the ingress
+	// tier.
 	if spec.PublishPort > 0 && spec.Port > 0 {
 		if cp, perr := nat.NewPort("tcp", strconv.Itoa(spec.Port)); perr == nil {
 			config.ExposedPorts = nat.PortSet{cp: struct{}{}}
 			hostConfig.PortBindings = nat.PortMap{
-				cp: []nat.PortBinding{{HostIP: e.publishHost, HostPort: strconv.Itoa(spec.PublishPort)}},
+				cp: []nat.PortBinding{{HostIP: e.publishHost, HostPort: ""}},
 			}
 		}
 	}
@@ -753,6 +779,9 @@ func (e *engineClient) toContainer(ctx context.Context, id string) Container {
 			c.EggID = info.Config.Labels[LabelEggID]
 			c.ImageRef = info.Config.Labels[LabelImageRef]
 			c.SpecVersion = info.Config.Labels[LabelVersion]
+			replica, hasReplica := replicaFromLabels(info.Config.Labels)
+			c.ReplicaIndex = replica
+			c.Legacy = !hasReplica
 		}
 		c.RestartCount = info.RestartCount
 		c.State = mapInspectState(info)
@@ -761,8 +790,44 @@ func (e *engineClient) toContainer(ctx context.Context, id string) Container {
 			c.State = contract.StateStarting
 		}
 		c.CgroupPath = cgroupPathFor(info)
+		c.PublishedPort = publishedPortFrom(info)
 	}
 	return c
+}
+
+// replicaFromLabels reads the 0-based replica index from a container's labels.
+// The second return is false for a container with no replica label, i.e. one made
+// by an older agent that predates replica indexing; the caller treats it as legacy.
+func replicaFromLabels(labels map[string]string) (int, bool) {
+	raw, ok := labels[LabelReplica]
+	if !ok || raw == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// publishedPortFrom returns the host port the container's app port is published
+// on, or 0 when nothing is published. We publish exactly one port per container,
+// so the first bound host port is the one ingress dials.
+func publishedPortFrom(info types.ContainerJSON) int {
+	if info.NetworkSettings == nil {
+		return 0
+	}
+	for _, bindings := range info.NetworkSettings.Ports {
+		for _, b := range bindings {
+			if b.HostPort == "" {
+				continue
+			}
+			if p, err := strconv.Atoi(b.HostPort); err == nil && p > 0 {
+				return p
+			}
+		}
+	}
+	return 0
 }
 
 // mapState maps a Docker container-summary state string to our contract state.
