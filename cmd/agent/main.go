@@ -436,10 +436,13 @@ func (a *agent) tick(ctx context.Context) {
 	} else {
 		portsByWorkload := make(map[string][]int)
 		for _, c := range actual {
-			// A replica whose host port is bound and which is up (running, or booting
-			// with a bound port) is an ingress upstream. Stopped and crashed replicas
-			// are excluded so traffic is not sent to a dead backend.
-			if c.PublishedPort > 0 && (c.State == contract.StateRunning || c.State == contract.StateStarting) {
+			// Only route to a replica that is up AND passing its health check (List
+			// reports a running-but-unhealthy container as Starting, so Running means
+			// healthy). This is what makes a roll zero-downtime: a still-booting new
+			// replica is not an upstream until it is healthy, and the old healthy
+			// replica keeps serving until then, so requests never hit a dead or
+			// not-yet-ready backend.
+			if c.PublishedPort > 0 && c.State == contract.StateRunning {
 				portsByWorkload[c.WorkloadID] = append(portsByWorkload[c.WorkloadID], c.PublishedPort)
 			}
 		}

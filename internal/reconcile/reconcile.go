@@ -21,14 +21,16 @@ import (
 type Action string
 
 const (
-	// ActionStart starts a missing container for a desired workload.
+	// ActionStart starts a fresh container for a replica slot: a plain first start,
+	// or the start half of a zero-downtime roll (the old container keeps serving).
 	ActionStart Action = "start"
-	// ActionStop stops and removes a container with no matching desired workload.
+	// ActionStop stops and removes a container immediately: a scale-down, an extra,
+	// a cold Egg or a duplicate.
 	ActionStop Action = "stop"
-	// ActionRestart restarts an unhealthy or crashed container.
+	// ActionRestart restarts an up-to-date but crashed container in place.
 	ActionRestart Action = "restart"
-	// ActionRoll stops a stale container (wrong image or spec version) and starts
-	// a fresh one.
+	// ActionRoll drains a superseded (stale or legacy) container gracefully, once a
+	// healthy replacement is already serving: the stop half of a zero-downtime roll.
 	ActionRoll Action = "roll"
 )
 
@@ -48,8 +50,10 @@ type Step struct {
 	ReplicaIndex int
 }
 
-// Plan is the ordered set of steps computed by Diff. Stops run before starts so
-// a roll frees resources before claiming them again.
+// Plan is the set of steps computed by Diff. A rolling deploy spans more than one
+// plan: an early plan starts the new container (leaving the old serving), and a
+// later plan drains the old once the new is healthy. No single plan ever stops a
+// slot's only healthy backend.
 type Plan struct {
 	Steps []Step
 }
@@ -58,15 +62,22 @@ type Plan struct {
 // containers. It is pure: it performs no I/O and mutates nothing, which is what
 // makes it unit testable.
 //
-// Rules, per desired workload with Replicas = N:
-//   - Exactly N replica slots (indices 0..N-1) should each have one healthy,
-//     up-to-date container. A missing slot is started; a stale one is rolled; an
-//     unhealthy or crashed one is restarted in place.
-//   - A container at an index >= N (a scale-down), a duplicate for a slot already
-//     filled, or a legacy container from an agent that predates replica indexing,
-//     is surplus and stopped.
-//   - Replicas == 0 stops every container for the workload (the Egg goes cold on
-//     purpose).
+// Rules, per desired workload with Replicas = N, one replica slot at a time
+// (indices 0..N-1), converging towards one healthy, up-to-date container per slot
+// WITHOUT ever taking the slot's only healthy backend away (zero-downtime rolls):
+//
+//   - No up-to-date container in the slot: START a new one. Any stale (old image or
+//     version) or legacy container in the slot is LEFT RUNNING so it keeps serving
+//     whilst the new one boots. This is the start half of a start-new-before-stop-old
+//     roll, and also the plain first start when the slot is empty.
+//   - An up-to-date container exists and is HEALTHY: the slot is served by new code,
+//     so DRAIN the old and legacy containers now (the stop half of the roll), and
+//     stop any duplicate up-to-date containers.
+//   - An up-to-date container exists but is still booting: WAIT. The old container
+//     (if any) keeps serving; nothing is stopped.
+//   - An up-to-date container has crashed: RESTART it in place.
+//   - A container at an index >= N (a scale-down) is surplus and stopped.
+//   - Replicas == 0 stops every container for the workload (the Egg goes cold).
 //   - A container with no matching desired workload is stopped (extra).
 func Diff(desired contract.DesiredState, actual []docker.Container) Plan {
 	var plan Plan
@@ -76,51 +87,86 @@ func Diff(desired contract.DesiredState, actual []docker.Container) Plan {
 		desiredByID[w.ID] = w
 	}
 
-	// Group observed containers by workload id, preserving listing order so the
-	// first container seen for a given replica slot is the one retained.
+	// Group observed containers by workload id.
 	byWorkload := make(map[string][]docker.Container, len(actual))
 	for _, c := range actual {
 		byWorkload[c.WorkloadID] = append(byWorkload[c.WorkloadID], c)
 	}
 
-	stop := func(c docker.Container, action Action) Step {
+	step := func(action Action, c docker.Container) Step {
 		return Step{Action: action, WorkloadID: c.WorkloadID, BlobID: c.BlobID, ContainerID: c.ID, ReplicaIndex: c.ReplicaIndex}
 	}
 
-	// First pass: stops and rolls (free resources before claiming them again).
-	// keepers[w.ID][idx] is the single container retained for that replica slot.
-	keepers := make(map[string]map[int]docker.Container, len(desired.Workloads))
 	for _, w := range desired.Workloads {
 		cs := byWorkload[w.ID]
 
 		// Desired cold: stop every container for this workload.
 		if w.Replicas <= 0 {
 			for _, c := range cs {
-				plan.Steps = append(plan.Steps, stop(c, ActionStop))
+				plan.Steps = append(plan.Steps, step(ActionStop, c))
 			}
 			continue
 		}
 
-		keep := make(map[int]docker.Container, w.Replicas)
+		// Bucket the workload's containers by replica slot; anything at an index
+		// beyond the desired count is a scale-down and stopped immediately.
+		bySlot := make(map[int][]docker.Container, w.Replicas)
 		for _, c := range cs {
-			// Legacy (no replica label), an index beyond the desired count (scale
-			// down), or a duplicate for an already-filled slot: all surplus, stop.
-			if c.Legacy || c.ReplicaIndex < 0 || c.ReplicaIndex >= w.Replicas {
-				plan.Steps = append(plan.Steps, stop(c, ActionStop))
+			if c.ReplicaIndex < 0 || c.ReplicaIndex >= w.Replicas {
+				plan.Steps = append(plan.Steps, step(ActionStop, c))
 				continue
 			}
-			if _, taken := keep[c.ReplicaIndex]; taken {
-				plan.Steps = append(plan.Steps, stop(c, ActionStop))
-				continue
-			}
-			keep[c.ReplicaIndex] = c
+			bySlot[c.ReplicaIndex] = append(bySlot[c.ReplicaIndex], c)
 		}
-		keepers[w.ID] = keep
 
-		// Roll any kept-but-stale replica: stop it here, start the replacement below.
 		for idx := 0; idx < w.Replicas; idx++ {
-			if c, ok := keep[idx]; ok && isStale(w, c, desired.Version) {
-				plan.Steps = append(plan.Steps, stop(c, ActionRoll))
+			var upToDate, old []docker.Container
+			for _, c := range bySlot[idx] {
+				// Legacy (pre-replica-index) and stale (wrong image or version)
+				// containers are "old": kept running until a fresh one is healthy.
+				if c.Legacy || isStale(w, c, desired.Version) {
+					old = append(old, c)
+				} else {
+					upToDate = append(upToDate, c)
+				}
+			}
+
+			if len(upToDate) == 0 {
+				// Start the fresh container; leave any old one serving in the meantime.
+				plan.Steps = append(plan.Steps, Step{Action: ActionStart, WorkloadID: w.ID, BlobID: w.BlobID, ReplicaIndex: idx})
+				continue
+			}
+
+			// Prefer a healthy up-to-date container as the keeper, so a flapping
+			// duplicate does not win and trigger a premature drain of the old one.
+			keeper := upToDate[0]
+			for _, c := range upToDate {
+				if healthy(c) {
+					keeper = c
+					break
+				}
+			}
+			// Stop any duplicate up-to-date containers for this slot.
+			for _, c := range upToDate {
+				if c.ID != keeper.ID {
+					plan.Steps = append(plan.Steps, step(ActionStop, c))
+				}
+			}
+
+			switch {
+			case healthy(keeper):
+				// New code is serving: drain the superseded old and legacy containers
+				// now. This is the stop half of the roll, and it only ever runs once a
+				// healthy replacement exists, so the slot is never left without a backend.
+				for _, c := range old {
+					plan.Steps = append(plan.Steps, step(ActionRoll, c))
+				}
+			case needsRestart(keeper):
+				// Up-to-date but crashed: restart in place. Any old container keeps
+				// serving until the restarted one is healthy.
+				plan.Steps = append(plan.Steps, step(ActionRestart, keeper))
+			default:
+				// Keeper is still booting: wait. The old container (if any) serves on.
 			}
 		}
 	}
@@ -128,33 +174,19 @@ func Diff(desired contract.DesiredState, actual []docker.Container) Plan {
 	// Extra containers: any observed workload not in desired state at all.
 	for _, c := range actual {
 		if _, wanted := desiredByID[c.WorkloadID]; !wanted {
-			plan.Steps = append(plan.Steps, stop(c, ActionStop))
-		}
-	}
-
-	// Second pass: starts and restarts, per replica slot.
-	for _, w := range desired.Workloads {
-		if w.Replicas <= 0 {
-			continue
-		}
-		keep := keepers[w.ID]
-		for idx := 0; idx < w.Replicas; idx++ {
-			c, present := keep[idx]
-			switch {
-			case !present:
-				// Missing slot: start it.
-				plan.Steps = append(plan.Steps, Step{Action: ActionStart, WorkloadID: w.ID, BlobID: w.BlobID, ReplicaIndex: idx})
-			case isStale(w, c, desired.Version):
-				// Already scheduled a roll (stop) above; start the replacement.
-				plan.Steps = append(plan.Steps, Step{Action: ActionStart, WorkloadID: w.ID, BlobID: w.BlobID, ReplicaIndex: idx})
-			case needsRestart(c):
-				// Present but unhealthy or crashed: restart in place.
-				plan.Steps = append(plan.Steps, Step{Action: ActionRestart, WorkloadID: w.ID, BlobID: w.BlobID, ContainerID: c.ID, ReplicaIndex: idx})
-			}
+			plan.Steps = append(plan.Steps, step(ActionStop, c))
 		}
 	}
 
 	return plan
+}
+
+// healthy reports whether a container is up and passing its health check, i.e. it
+// is a live backend that ingress will route to. List reports a running-but-unhealthy
+// container as Starting, so a Running state already implies the last probe passed;
+// the explicit Healthy check keeps unit tests that set the fields directly honest.
+func healthy(c docker.Container) bool {
+	return c.State == contract.StateRunning && c.Healthy
 }
 
 // isStale reports whether an existing container no longer matches the desired
@@ -196,12 +228,20 @@ func Apply(ctx context.Context, cli docker.Client, desired contract.DesiredState
 	var errs []error
 	for _, step := range plan.Steps {
 		switch step.Action {
-		case ActionStop, ActionRoll:
-			// Roll's stop half and a plain stop are the same idempotent removal.
-			// Roll's start half is emitted as a separate ActionStart step.
+		case ActionStop:
+			// Immediate removal: a scale-down, an extra, a cold Egg or a duplicate.
 			if step.ContainerID != "" {
 				if err := cli.Stop(ctx, step.ContainerID); err != nil {
 					errs = append(errs, fmt.Errorf("stop %s: %w", step.WorkloadID, err))
+				}
+			}
+		case ActionRoll:
+			// The stop half of a zero-downtime roll: gracefully drain the old container
+			// now that a healthy replacement is serving. Its replacement was started on
+			// an earlier tick as a separate ActionStart.
+			if step.ContainerID != "" {
+				if err := cli.Drain(ctx, step.ContainerID); err != nil {
+					errs = append(errs, fmt.Errorf("drain %s: %w", step.WorkloadID, err))
 				}
 			}
 		case ActionStart:

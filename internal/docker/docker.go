@@ -155,9 +155,13 @@ type Client interface {
 	// every axis. It is idempotent by (workload, replica) identity: if a matching
 	// container already exists for this spec version it is a no-op.
 	Create(ctx context.Context, spec contract.WorkloadSpec, version string, replica int) (Container, error)
-	// Stop stops and removes the container with the given ID. Idempotent: a
-	// missing container is treated as success.
+	// Stop stops and removes the container with the given ID immediately. Idempotent:
+	// a missing container is treated as success.
 	Stop(ctx context.Context, id string) error
+	// Drain gracefully stops (SIGTERM, grace period) and removes a container that has
+	// been superseded by a healthy replacement, so in-flight requests can finish. Used
+	// for the old container in a zero-downtime rolling deploy. Idempotent.
+	Drain(ctx context.Context, id string) error
 	// Restart restarts the container with the given ID. Idempotent.
 	Restart(ctx context.Context, id string) error
 	// Stats returns current memory and CPU usage for a container, read via the
@@ -206,8 +210,17 @@ func NewEngineClient() (Client, error) {
 
 // containerName builds a stable, idempotent container name from the workload
 // identity so repeated Create calls collide by name rather than duplicating.
-func containerName(workloadID string, replica int) string {
-	return fmt.Sprintf("ruust-%s-%d", workloadID, replica)
+// containerName includes the desired-state version so a rolling deploy can run the
+// new container BESIDE the old one for the same replica slot (they differ only by
+// version), rather than having to stop the old before the new can take its name.
+// This is what makes a zero-downtime, start-new-before-stop-old roll possible. It
+// is still deterministic, so Create stays idempotent: the same (workload, replica,
+// version) always maps to the same container.
+func containerName(workloadID string, replica int, version string) string {
+	if version == "" {
+		return fmt.Sprintf("ruust-%s-%d", workloadID, replica)
+	}
+	return fmt.Sprintf("ruust-%s-%d-%s", workloadID, replica, version)
 }
 
 func (e *engineClient) List(ctx context.Context) ([]Container, error) {
@@ -372,7 +385,7 @@ func (e *engineClient) ensurePrivateNetwork(ctx context.Context, name string) er
 }
 
 func (e *engineClient) Create(ctx context.Context, spec contract.WorkloadSpec, version string, replica int) (Container, error) {
-	name := containerName(spec.ID, replica)
+	name := containerName(spec.ID, replica, version)
 
 	// Idempotency: if a container with this name already exists for the same
 	// spec version, do nothing. If it exists for an older version, the caller
@@ -641,6 +654,29 @@ func (e *engineClient) Stop(ctx context.Context, id string) error {
 	err := e.cli.ContainerRemove(ctx, id, container.RemoveOptions{Force: true})
 	if err != nil && !client.IsErrNotFound(err) {
 		return fmt.Errorf("removing container %q: %w", id, err)
+	}
+	return nil
+}
+
+// drainTimeout is how long a superseded container is given to finish in-flight
+// requests (SIGTERM, then SIGKILL) before it is removed during a rolling deploy.
+const drainTimeout = 10
+
+// Drain gracefully retires a superseded container during a zero-downtime roll: it
+// sends SIGTERM and waits up to drainTimeout for in-flight requests to finish, then
+// removes it. Only called once a healthy replacement is already serving, so this
+// never creates a gap in availability. Idempotent: a missing container is success.
+func (e *engineClient) Drain(ctx context.Context, id string) error {
+	timeout := drainTimeout
+	if err := e.cli.ContainerStop(ctx, id, container.StopOptions{Timeout: &timeout}); err != nil &&
+		!client.IsErrNotFound(err) {
+		// A stop failure should not strand the container; fall through to removal.
+		e.cli.ContainerRemove(ctx, id, container.RemoveOptions{Force: true}) //nolint:errcheck
+		return nil
+	}
+	if err := e.cli.ContainerRemove(ctx, id, container.RemoveOptions{Force: true}); err != nil &&
+		!client.IsErrNotFound(err) {
+		return fmt.Errorf("removing drained container %q: %w", id, err)
 	}
 	return nil
 }
