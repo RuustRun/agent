@@ -922,6 +922,23 @@ func (e *engineClient) probeHealth(ctx context.Context, info types.ContainerJSON
 	if info.Config != nil {
 		labels = info.Config.Labels
 	}
+	// Prefer the published host port when the container has one. It is reachable
+	// whether or not the host can route to container bridge IPs (it cannot on Docker
+	// Desktop, so a bridge-IP probe always fails locally), and it is exactly the path
+	// ingress uses, so a passing probe means the Egg is reachable the way traffic
+	// actually reaches it. It still fails for an app bound only to the container's
+	// loopback, since Docker forwards a published port to the container's bridge
+	// interface, not its 127.0.0.1, so the localhost-bind check still holds.
+	if hp := publishedPortFrom(info); hp > 0 {
+		host := e.publishHost
+		if host == "" || host == "0.0.0.0" {
+			host = "127.0.0.1"
+		}
+		return probeTCP(ctx, net.JoinHostPort(host, strconv.Itoa(hp)))
+	}
+	// No published port (e.g. a database Egg reached only over its private network):
+	// probe the container on its bridge address, which the agent can reach on a real
+	// production host. When neither is determinable, fall back to Docker's own check.
 	port := labels[LabelPort]
 	ip := containerIP(info)
 	if port == "" || port == "0" || ip == "" {
