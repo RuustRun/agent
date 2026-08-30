@@ -31,11 +31,11 @@ func TestReplicaLifecycle(t *testing.T) {
 	spec := contract.WorkloadSpec{
 		ID: id, BlobID: "blob", EggID: "egg", ImageRef: "redis:7-alpine",
 		Replicas: 3, Port: 6379, PublishPort: 1, HealthCheckPath: "/",
-		// Drop only NET_RAW here: the redis:7-alpine entrypoint drops privileges via
-		// su-exec and so needs SETUID/SETGID/CHOWN, whereas a real web Egg image runs
-		// as root and drops ALL. The dropped-cap set is orthogonal to what this test
-		// checks (per-replica ports), so a harmless single drop keeps it self-contained.
-		Limits: contract.ResourceLimits{MemoryMb: 64, CpuFloor: 0.25, CpuBurst: 1.0, PidsLimit: 128, DroppedCaps: []string{"NET_RAW"}},
+		// Empty DroppedCaps ("drop nothing") is the real database-Egg profile: the
+		// redis:7-alpine entrypoint drops privileges via su-exec and so needs
+		// SETUID/SETGID/CHOWN. This also exercises the fix that an explicit empty list
+		// is honoured, not turned into "drop ALL".
+		Limits: contract.ResourceLimits{MemoryMb: 64, CpuFloor: 0.25, CpuBurst: 1.0, PidsLimit: 128, DroppedCaps: []string{}},
 	}
 
 	stopOurs := func() {

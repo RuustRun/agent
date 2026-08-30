@@ -430,8 +430,15 @@ func (e *engineClient) Create(ctx context.Context, spec contract.WorkloadSpec, v
 	}
 
 	limits := spec.Limits
+	// Capabilities to drop. Only default to dropping EVERYTHING when the field is
+	// absent (a nil slice, i.e. an older control plane that does not send it). An
+	// explicit empty list means "drop nothing", which is exactly what a database Egg
+	// needs: the official Postgres/Redis images start as root, chown their data dir
+	// and drop to their own user, so they require CHOWN/SETUID/SETGID. Turning an
+	// empty list into ["ALL"] here was crashing every database Egg with
+	// "chmod: Operation not permitted" / "failed switching to 'postgres'".
 	dropped := limits.DroppedCaps
-	if len(dropped) == 0 {
+	if dropped == nil {
 		dropped = []string{"ALL"}
 	}
 

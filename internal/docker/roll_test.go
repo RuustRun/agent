@@ -30,7 +30,7 @@ func TestRollCoexistThenDrain(t *testing.T) {
 	spec := contract.WorkloadSpec{
 		ID: id, BlobID: "blob", EggID: "egg", ImageRef: "redis:7-alpine",
 		Replicas: 1, Port: 6379, PublishPort: 1, HealthCheckPath: "/",
-		Limits: contract.ResourceLimits{MemoryMb: 64, CpuFloor: 0.25, CpuBurst: 1.0, PidsLimit: 128, DroppedCaps: []string{"NET_RAW"}},
+		Limits: contract.ResourceLimits{MemoryMb: 64, CpuFloor: 0.25, CpuBurst: 1.0, PidsLimit: 128, DroppedCaps: []string{}},
 	}
 
 	stopOurs := func() {
