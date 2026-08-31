@@ -163,6 +163,43 @@ func countActions(plan Plan, action Action) int {
 	return n
 }
 
+// TestStatefulRollStopsBeforeStart proves a volume-bearing (database) Egg rolls
+// stop-old-before-start-new, so two engines never share one data dir, whilst a
+// stateless Egg still rolls zero-downtime (start-new-before-stop-old).
+func TestStatefulRollStopsBeforeStart(t *testing.T) {
+	const oldV, newV = "v-old", "v-new"
+
+	// A stateful workload (has a persistent volume) with a stale container in slot 0.
+	dbSpec := spec("db", 1, "postgres:16")
+	dbSpec.Volumes = []contract.VolumeMount{{Name: "ruust-vol-blob-db", Path: "/var/lib/postgresql/data"}}
+	staleDB := runningVersion("db", "postgres:16", oldV, 0)
+
+	desired := contract.DesiredState{Version: newV, Workloads: []contract.WorkloadSpec{dbSpec}}
+	plan := Diff(desired, []docker.Container{staleDB})
+	if got := countActions(plan, ActionStart); got != 0 {
+		t.Errorf("stateful roll must not start a new container alongside the old one, got %d starts", got)
+	}
+	if got := countActions(plan, ActionStop); got != 1 {
+		t.Errorf("stateful roll must stop the old container first, got %d stops", got)
+	}
+
+	// Once the slot is empty, the fresh container starts.
+	if got := countActions(Diff(desired, nil), ActionStart); got != 1 {
+		t.Errorf("stateful workload with an empty slot should start once, got %d", got)
+	}
+
+	// Contrast: a stateless workload rolls zero-downtime (start new, keep old serving).
+	webSpec := spec("web", 1, "nginx:2")
+	staleWeb := runningVersion("web", "nginx:1", oldV, 0)
+	webPlan := Diff(contract.DesiredState{Version: newV, Workloads: []contract.WorkloadSpec{webSpec}}, []docker.Container{staleWeb})
+	if got := countActions(webPlan, ActionStart); got != 1 {
+		t.Errorf("stateless roll should start the new container first, got %d", got)
+	}
+	if got := countActions(webPlan, ActionStop) + countActions(webPlan, ActionRoll); got != 0 {
+		t.Errorf("stateless roll must not drain the old container before the new is healthy, got %d", got)
+	}
+}
+
 func TestDiff(t *testing.T) {
 	const version = "v-abc"
 

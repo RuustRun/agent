@@ -108,6 +108,13 @@ func Diff(desired contract.DesiredState, actual []docker.Container) Plan {
 			continue
 		}
 
+		// A stateful workload keeps its data on ONE shared persistent volume, so a
+		// slot can never hold two containers at once: a second database engine locks
+		// on the data dir (Postgres postmaster.pid) and crash-loops. Such a workload
+		// therefore rolls stop-old-before-start-new (a brief blip) instead of the
+		// stateless zero-downtime start-new-before-stop-old.
+		stateful := len(w.Volumes) > 0
+
 		// Bucket the workload's containers by replica slot; anything at an index
 		// beyond the desired count is a scale-down and stopped immediately.
 		bySlot := make(map[int][]docker.Container, w.Replicas)
@@ -132,7 +139,18 @@ func Diff(desired contract.DesiredState, actual []docker.Container) Plan {
 			}
 
 			if len(upToDate) == 0 {
-				// Start the fresh container; leave any old one serving in the meantime.
+				// Stateful: never start a second container on the shared volume. Stop the
+				// old one now; the fresh one starts on the next tick once the slot is
+				// empty (stop-old-before-start-new). This is what makes a database Egg
+				// redeploy or restart work instead of deadlocking two engines on one dir.
+				if stateful && len(old) > 0 {
+					for _, c := range old {
+						plan.Steps = append(plan.Steps, step(ActionStop, c))
+					}
+					continue
+				}
+				// Slot empty (or stateless): start the fresh container. For a stateless
+				// workload any old container is left serving until the new one is healthy.
 				plan.Steps = append(plan.Steps, Step{Action: ActionStart, WorkloadID: w.ID, BlobID: w.BlobID, ReplicaIndex: idx})
 				continue
 			}
