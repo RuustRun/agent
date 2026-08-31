@@ -175,7 +175,20 @@ type agent struct {
 	// plane's state transition does not re-snapshot or re-restore. Poll loop is
 	// single-goroutine, so this needs no lock.
 	migrationDone map[string]bool
+
+	// diskUsage caches the last measured volume usage per container id, so du runs at
+	// most once per diskMeasureTTL per container rather than on every status report.
+	diskUsage map[string]diskSample
 }
+
+// diskSample is a cached volume-usage measurement (bytes) and when it was taken.
+type diskSample struct {
+	at    time.Time
+	bytes int64
+}
+
+// diskMeasureTTL bounds how often the (heavier) du runs per container.
+const diskMeasureTTL = 60 * time.Second
 
 // run drives the poll loop until the context is cancelled. Each tick fires after
 // the base interval plus a random jitter, which spreads load across a fleet so
@@ -588,6 +601,10 @@ func (a *agent) reportStatus(ctx context.Context, appliedVersion string) {
 			a.logSince[c.ID] = logs[n-1].Ts // advance the cursor to the newest line
 		}
 
+		// Volume usage for a stateful Egg, on a slower cadence than the poll (du is
+		// heavier than a stats read). Zero for a web Egg (no volume) or a cycle where
+		// it was not re-measured; omitted from the JSON so it never clobbers the last
+		// known figure on the control plane.
 		health = append(health, contract.ContainerHealth{
 			WorkloadID:   c.WorkloadID,
 			BlobID:       c.BlobID,
@@ -595,6 +612,7 @@ func (a *agent) reportStatus(ctx context.Context, appliedVersion string) {
 			Healthy:      c.Healthy,
 			RestartCount: c.RestartCount,
 			Usage:        usage,
+			DiskBytes:    a.measureDisk(ctx, c.ID),
 			Logs:         logs,
 		})
 	}
@@ -653,6 +671,31 @@ func (a *agent) reportStatus(ctx context.Context, appliedVersion string) {
 }
 
 // authorise attaches the host bearer token. The token is never logged.
+// measureDisk returns the on-disk usage (bytes) of a container's persistent volumes,
+// cached per container for diskMeasureTTL so du stays off the hot path. Returns 0 when
+// the container has no volume (a web Egg), the engine cannot measure it, or it was
+// measured recently and the cache is warm but empty. A 0 is omitted from the report
+// (omitempty), so it never clobbers the last known figure on the control plane.
+func (a *agent) measureDisk(ctx context.Context, containerID string) int64 {
+	du, ok := a.docker.(docker.DiskUsager)
+	if !ok {
+		return 0
+	}
+	if a.diskUsage == nil {
+		a.diskUsage = make(map[string]diskSample)
+	}
+	if s, ok := a.diskUsage[containerID]; ok && time.Since(s.at) < diskMeasureTTL {
+		return s.bytes
+	}
+	n, err := du.VolumeUsageBytes(ctx, containerID)
+	if err != nil {
+		a.log.Warn("could not measure volume usage", "err", err)
+		return 0
+	}
+	a.diskUsage[containerID] = diskSample{at: time.Now(), bytes: n}
+	return n
+}
+
 func (a *agent) authorise(req *http.Request) {
 	req.Header.Set("Authorization", "Bearer "+a.cfg.hostToken)
 	req.Header.Set("User-Agent", "ruust-agent/"+agentVersion)

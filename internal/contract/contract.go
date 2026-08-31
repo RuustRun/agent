@@ -398,6 +398,11 @@ type ContainerHealth struct {
 	RestartCount int `json:"restartCount"`
 	// Usage is the measured cgroup usage.
 	Usage CgroupUsage `json:"usage"`
+	// DiskBytes is the on-disk usage of the Egg's persistent volume in bytes, for a
+	// stateful (database) Egg. Zero/omitted for a stateless web Egg (no volume), and
+	// omitted on reports where it was not measured this cycle (measured on a slower
+	// cadence than the poll to keep du off the hot path).
+	DiskBytes int64 `json:"diskBytes,omitempty"`
 	// Logs are the container output lines produced since the last report
 	// (incremental, may be empty).
 	Logs []LogLine `json:"logs"`
