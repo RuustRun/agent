@@ -945,6 +945,16 @@ func (e *engineClient) probeHealth(ctx context.Context, info types.ContainerJSON
 		}
 		return probeHTTP(ctx, host, hp, path)
 	}
+	// A stateful database Egg speaks a database wire protocol, not HTTP, has no
+	// published port, and is reached only over its private network. It cannot be
+	// meaningfully probed from the host (on Docker Desktop the container bridge IP is
+	// not even routable), so an HTTP or TCP probe would fail forever and the agent
+	// would restart-loop a perfectly healthy engine into a crash. Treat it as healthy
+	// whenever its container is running: if the engine dies the container exits and
+	// this turns false, so a genuine crash still triggers a restart.
+	if hasPersistentVolume(info) {
+		return isHealthy(info)
+	}
 	// No published port (e.g. a database Egg reached only over its private network):
 	// probe the container on its bridge address, which the agent can reach on a real
 	// production host. When neither is determinable, fall back to Docker's own check.

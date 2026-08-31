@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/mount"
 )
 
@@ -21,6 +22,18 @@ import (
 // image can declare one), so a web Egg reports zero and a database Egg reports the
 // real data size.
 const PersistentVolumePrefix = "ruust-vol-"
+
+// hasPersistentVolume reports whether the container mounts a Ruust persistent volume
+// (a stateful database Egg). Used to pick the right health check: such an Egg is
+// healthy whenever it is running, since it has no HTTP endpoint to probe.
+func hasPersistentVolume(info types.ContainerJSON) bool {
+	for _, m := range info.Mounts {
+		if m.Type == mount.TypeVolume && strings.HasPrefix(m.Name, PersistentVolumePrefix) {
+			return true
+		}
+	}
+	return false
+}
 
 // DiskUsager measures the on-disk usage of a container's persistent volumes. Kept
 // separate from the core Client so reconcile and its fake need not know about it; the
