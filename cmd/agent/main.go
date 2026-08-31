@@ -123,6 +123,7 @@ func main() {
 		cfg:     cfg,
 		docker:  dcli,
 		http:    &http.Client{Timeout: 15 * time.Second},
+		migHTTP: &http.Client{Timeout: 10 * time.Minute},
 		stats:   cgroups.NewReader(),
 		log:     log,
 		logs:    logs,
@@ -163,6 +164,17 @@ type agent struct {
 	// already shipped, so each report carries only new output (incremental). The
 	// poll loop is single-goroutine, so this needs no lock.
 	logSince map[string]string
+
+	// migHTTP is a separate HTTP client with a generous timeout for migration
+	// snapshot transfers, which can be far larger and slower than a normal
+	// control-plane call. The default a.http (15s) would abort a big dump.
+	migHTTP *http.Client
+
+	// migrationDone guards against re-running a migration role already completed in
+	// this process (keyed "<migrationId>:<role>"), so a report that raced the control
+	// plane's state transition does not re-snapshot or re-restore. Poll loop is
+	// single-goroutine, so this needs no lock.
+	migrationDone map[string]bool
 }
 
 // run drives the poll loop until the context is cancelled. Each tick fires after
@@ -423,6 +435,12 @@ func (a *agent) tick(ctx context.Context) {
 	} else {
 		a.appliedVersion = desired.Version
 	}
+
+	// Database Egg migrations, if any. Run AFTER converge so a quiescing source's
+	// serving container is already stopped before we snapshot its volume. Best effort
+	// and idempotent: a failure is reported and retried next tick, and never blocks
+	// the rest of the loop.
+	a.handleMigrations(ctx, desired)
 
 	// Reconcile ingress: for every Egg that is published (a web Egg, PublishPort > 0)
 	// and has at least one hostname, register a Caddy route that load-balances across

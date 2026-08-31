@@ -16,14 +16,34 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/RuustRun/agent/internal/contract"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/pkg/stdcopy"
 )
+
+// Migrator is the database Egg migration capability, kept separate from the core
+// Client so the reconcile logic (and its fake) need not know about it. The real
+// engineClient implements both; the agent's migration handler type-asserts to this.
+type Migrator interface {
+	// SnapshotLive streams a logical dump of the LIVE serving container to w and reads
+	// the verification counts. The source keeps serving during the dump: pg_dump takes
+	// an MVCC-consistent snapshot and redis SAVE flushes current memory to disk, so the
+	// dump reflects a real point in time. Snapshotting the live container (rather than a
+	// throwaway on a stopped volume) is what makes it correct for an in-memory engine
+	// like Redis, whose data is not on disk until it is saved.
+	SnapshotLive(ctx context.Context, engine, containerID string, env []string, w io.Writer) (contract.MigrationCounts, error)
+	// RestoreDatabase restores a logical dump read from r into a FRESH copy of the
+	// Egg's volume, reads the verification counts, then removes the restore container
+	// (the Egg only starts serving on the target after cutover). Isolated (no network)
+	// and idempotent: a retry re-restores cleanly.
+	RestoreDatabase(ctx context.Context, engine, name, volumeName, image string, env []string, r io.Reader) (contract.MigrationCounts, error)
+}
 
 // envValue extracts KEY from a slice of "KEY=VALUE" strings, or returns def.
 func envValue(env []string, key, def string) string {
@@ -282,4 +302,163 @@ func (e *engineClient) RedisCommand(ctx context.Context, containerID string, arg
 	var out bytes.Buffer
 	err := e.execCapture(ctx, containerID, append([]string{"redis-cli"}, args...), nil, nil, &out)
 	return strings.TrimSpace(out.String()), err
+}
+
+// ---- Higher-level migration orchestration (implements Migrator) --------------
+
+// pgTableCountSQL counts a database's user tables, the measure the control plane
+// compares between source and target before it cuts over.
+const pgTableCountSQL = "SELECT count(*) FROM information_schema.tables " +
+	"WHERE table_schema NOT IN ('pg_catalog','information_schema')"
+
+// removeByName force-removes a container by name, ignoring "no such container".
+func (e *engineClient) removeByName(ctx context.Context, name string) {
+	_ = e.cli.ContainerRemove(ctx, name, container.RemoveOptions{Force: true})
+}
+
+// SnapshotLive implements Migrator: dump the live serving container to w and read its
+// verification counts. The source keeps running throughout.
+func (e *engineClient) SnapshotLive(ctx context.Context, engine, containerID string, env []string, w io.Writer) (contract.MigrationCounts, error) {
+	switch engine {
+	case "postgres":
+		if err := e.SnapshotPostgres(ctx, containerID, env, w); err != nil {
+			return contract.MigrationCounts{}, err
+		}
+		return e.postgresCounts(ctx, containerID, env)
+	case "redis":
+		if err := e.SnapshotRedis(ctx, containerID, w); err != nil {
+			return contract.MigrationCounts{}, err
+		}
+		return e.redisCounts(ctx, containerID)
+	default:
+		return contract.MigrationCounts{}, fmt.Errorf("unknown database engine %q", engine)
+	}
+}
+
+// RestoreDatabase implements Migrator: restore the dump read from r into a fresh copy
+// of volumeName, read the verification counts, then remove the restore container.
+func (e *engineClient) RestoreDatabase(ctx context.Context, engine, name, volumeName, image string, env []string, r io.Reader) (contract.MigrationCounts, error) {
+	switch engine {
+	case "postgres":
+		id, err := e.restorePostgresIsolated(ctx, name, volumeName, image, env, r)
+		defer e.removeByName(ctx, name)
+		if err != nil {
+			return contract.MigrationCounts{}, err
+		}
+		return e.postgresCounts(ctx, id, env)
+	case "redis":
+		id, err := e.restoreRedisIsolated(ctx, name, volumeName, image, r)
+		defer e.removeByName(ctx, name)
+		defer e.removeByName(ctx, name+"-seed")
+		if err != nil {
+			return contract.MigrationCounts{}, err
+		}
+		return e.redisCounts(ctx, id)
+	default:
+		return contract.MigrationCounts{}, fmt.Errorf("unknown database engine %q", engine)
+	}
+}
+
+// restorePostgresIsolated boots a fresh Postgres on the target volume (entrypoint runs
+// initdb), waits until it is genuinely ready, then pg_restores the dump. Isolated (no
+// network): the restored Egg only serves after cutover, on the normal path.
+func (e *engineClient) restorePostgresIsolated(ctx context.Context, name, volumeName, image string, env []string, r io.Reader) (string, error) {
+	if err := e.EnsureImage(ctx, image); err != nil {
+		return "", err
+	}
+	e.removeByName(ctx, name)
+	created, err := e.cli.ContainerCreate(ctx,
+		&container.Config{Image: image, Env: env},
+		&container.HostConfig{
+			NetworkMode:   "none",
+			RestartPolicy: container.RestartPolicy{Name: container.RestartPolicyDisabled},
+			Mounts:        []mount.Mount{{Type: mount.TypeVolume, Source: volumeName, Target: "/var/lib/postgresql/data"}},
+		}, nil, nil, name)
+	if err != nil {
+		return "", fmt.Errorf("creating restore container: %w", err)
+	}
+	if err := e.cli.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
+		return created.ID, fmt.Errorf("starting restore container: %w", err)
+	}
+	if err := e.waitPgReady(ctx, created.ID, env, 90*time.Second); err != nil {
+		return created.ID, err
+	}
+	user := envValue(env, "POSTGRES_USER", "postgres")
+	dbname := envValue(env, "POSTGRES_DB", user)
+	if err := e.execCapture(ctx, created.ID,
+		[]string{"pg_restore", "-U", user, "-d", dbname, "--clean", "--if-exists", "--no-owner"},
+		pgEnv(env), r, io.Discard); err != nil {
+		return created.ID, fmt.Errorf("pg_restore: %w", err)
+	}
+	return created.ID, nil
+}
+
+// restoreRedisIsolated writes the RDB into a fresh volume BEFORE Redis boots (Redis
+// only loads an RDB at startup), then boots Redis on that volume with no network.
+func (e *engineClient) restoreRedisIsolated(ctx context.Context, name, volumeName, image string, r io.Reader) (string, error) {
+	if err := e.EnsureImage(ctx, image); err != nil {
+		return "", err
+	}
+	mounts := []mount.Mount{{Type: mount.TypeVolume, Source: volumeName, Target: "/data"}}
+
+	// Seed helper: never runs Redis, just holds the volume so we can write dump.rdb in.
+	helper := name + "-seed"
+	e.removeByName(ctx, helper)
+	hCreated, err := e.cli.ContainerCreate(ctx,
+		&container.Config{Image: image, Entrypoint: []string{"sh", "-c", "sleep 3600"}},
+		&container.HostConfig{NetworkMode: "none", Mounts: mounts, RestartPolicy: container.RestartPolicy{Name: container.RestartPolicyDisabled}},
+		nil, nil, helper)
+	if err != nil {
+		return "", fmt.Errorf("creating seed container: %w", err)
+	}
+	if err := e.cli.ContainerStart(ctx, hCreated.ID, container.StartOptions{}); err != nil {
+		return "", fmt.Errorf("starting seed container: %w", err)
+	}
+	writeErr := e.execCapture(ctx, hCreated.ID, []string{"sh", "-c", "cat > /data/dump.rdb"}, nil, r, io.Discard)
+	e.removeByName(ctx, helper)
+	if writeErr != nil {
+		return "", fmt.Errorf("writing rdb into volume: %w", writeErr)
+	}
+
+	e.removeByName(ctx, name)
+	created, err := e.cli.ContainerCreate(ctx,
+		&container.Config{Image: image},
+		&container.HostConfig{NetworkMode: "none", Mounts: mounts, RestartPolicy: container.RestartPolicy{Name: container.RestartPolicyDisabled}},
+		nil, nil, name)
+	if err != nil {
+		return "", fmt.Errorf("creating redis container: %w", err)
+	}
+	if err := e.cli.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
+		return created.ID, fmt.Errorf("starting redis container: %w", err)
+	}
+	if err := e.waitRedisReady(ctx, created.ID, 30*time.Second); err != nil {
+		return created.ID, err
+	}
+	return created.ID, nil
+}
+
+// postgresCounts reads the verification counts for a running Postgres container.
+func (e *engineClient) postgresCounts(ctx context.Context, id string, env []string) (contract.MigrationCounts, error) {
+	tables, err := e.QueryScalarPostgres(ctx, id, env, pgTableCountSQL)
+	if err != nil {
+		return contract.MigrationCounts{}, fmt.Errorf("counting tables: %w", err)
+	}
+	n, err := strconv.Atoi(tables)
+	if err != nil {
+		return contract.MigrationCounts{}, fmt.Errorf("parsing table count %q: %w", tables, err)
+	}
+	return contract.MigrationCounts{Tables: n}, nil
+}
+
+// redisCounts reads the verification counts for a running Redis container.
+func (e *engineClient) redisCounts(ctx context.Context, id string) (contract.MigrationCounts, error) {
+	size, err := e.RedisCommand(ctx, id, "DBSIZE")
+	if err != nil {
+		return contract.MigrationCounts{}, fmt.Errorf("reading dbsize: %w", err)
+	}
+	n, err := strconv.Atoi(size)
+	if err != nil {
+		return contract.MigrationCounts{}, fmt.Errorf("parsing dbsize %q: %w", size, err)
+	}
+	return contract.MigrationCounts{Keys: n}, nil
 }

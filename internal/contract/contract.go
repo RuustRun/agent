@@ -252,6 +252,10 @@ type WorkloadSpec struct {
 	// Each survives container recreation, so the data outlives a redeploy or
 	// restart. Empty for stateless (web) Eggs.
 	Volumes []VolumeMount `json:"volumes,omitempty"`
+	// Migration, when set, is a database Egg migration in flight this host has a part
+	// in (source: snapshot + upload; target: download + restore). Nil for a normal
+	// workload. See MigrationDirective.
+	Migration *MigrationDirective `json:"migration,omitempty"`
 	// Limits are the hard resource limits enforced by the agent.
 	Limits ResourceLimits `json:"limits"`
 	// EnvValues is the decrypted env as "KEY=VALUE" lines, populated locally by the
@@ -267,6 +271,59 @@ type NetworkAttachment struct {
 	Name string `json:"name"`
 	// Alias is this Egg's stable DNS name on that network.
 	Alias string `json:"alias"`
+}
+
+// MigrationDirective tells this host its part in a database Egg migration, so a node
+// can be drained without losing the Egg's host-local volume. It is emitted to the
+// SOURCE host (role "source": snapshot the live database and upload the bytes) and to
+// the TARGET host (role "target": download and restore into a fresh volume). Every
+// step keys on ID so it is idempotent and safely retryable, and the source stays
+// authoritative and untouched until the target is verified.
+type MigrationDirective struct {
+	// ID is the migration id, the idempotency key for every step.
+	ID string `json:"id"`
+	// Role is this host's part: "source" or "target".
+	Role string `json:"role"`
+	// Phase is which snapshot this directive is for: "base" or "delta".
+	Phase string `json:"phase"`
+	// Engine is the database engine: "postgres" or "redis".
+	Engine string `json:"engine"`
+	// VolumeName is the Egg's persistent volume name, identical on both hosts.
+	VolumeName string `json:"volumeName"`
+	// PutURL / GetURL are where to move the snapshot bytes. Empty means use the
+	// control-plane relay endpoint (authenticated with the host token); a production
+	// deploy supplies presigned object-storage URLs instead.
+	PutURL string `json:"putUrl,omitempty"`
+	GetURL string `json:"getUrl,omitempty"`
+	// Checksum is the sha256 the target verifies against the downloaded snapshot.
+	Checksum string `json:"checksum,omitempty"`
+	// Quiesce (source only) means stop serving writes before the delta snapshot.
+	Quiesce bool `json:"quiesce,omitempty"`
+}
+
+// MigrationCounts is the engine-specific verification measure an agent reports for
+// a migration snapshot or restore, so the control plane can confirm the copy is
+// complete before it cuts over. Postgres reports the table count, Redis the key
+// count; rows is carried when cheap. Zero fields are omitted.
+type MigrationCounts struct {
+	Tables int `json:"tables,omitempty"`
+	Rows   int `json:"rows,omitempty"`
+	Keys   int `json:"keys,omitempty"`
+}
+
+// MigrationReport is what an agent POSTs to /api/v1/hosts/:id/migration-status to
+// advance a database Egg migration it has a part in. State is one of "started",
+// "uploaded" (source finished snapshot + upload), "restored", "verified" (target
+// restored and self-checked) or "failed". Never carries secret values.
+type MigrationReport struct {
+	MigrationID string           `json:"migrationId"`
+	Role        string           `json:"role"`
+	Phase       string           `json:"phase,omitempty"`
+	State       string           `json:"state"`
+	Counts      *MigrationCounts `json:"counts,omitempty"`
+	Checksum    string           `json:"checksum,omitempty"`
+	SizeBytes   int64            `json:"sizeBytes,omitempty"`
+	Error       string           `json:"error,omitempty"`
 }
 
 // VolumeMount is one persistent named volume mounted into a stateful Egg. The
