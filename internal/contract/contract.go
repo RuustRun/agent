@@ -256,12 +256,46 @@ type WorkloadSpec struct {
 	// in (source: snapshot + upload; target: download + restore). Nil for a normal
 	// workload. See MigrationDirective.
 	Migration *MigrationDirective `json:"migration,omitempty"`
+	// Build, when set, tells this host to build the image from source LOCALLY (bring
+	// your own host) before running it, so the customer's code never leaves the box.
+	// Nil for a normal, already-built or registry-pulled workload. See BuildDirective.
+	Build *BuildDirective `json:"build,omitempty"`
 	// Limits are the hard resource limits enforced by the agent.
 	Limits ResourceLimits `json:"limits"`
 	// EnvValues is the decrypted env as "KEY=VALUE" lines, populated locally by the
 	// agent from the secrets endpoint. It is never on the wire (json:"-") and is
 	// never logged.
 	EnvValues []string `json:"-"`
+	// BuildToken is a short-lived git clone token for a PRIVATE host-built repo,
+	// populated locally from the secrets endpoint. Never on the wire (json:"-"),
+	// never logged, and never injected into the running container.
+	BuildToken string `json:"-"`
+}
+
+// BuildDirective tells a bring-your-own-host agent to build a workload's image from
+// its git repository locally (nixpacks, or the repo Dockerfile), tag it ImageTag,
+// and then run it. The build is idempotent: if ImageTag already exists locally the
+// agent skips it. Build progress and logs are reported back on the status endpoint.
+type BuildDirective struct {
+	// DeploymentID is echoed back on the status report so the control plane can move
+	// the right Deployment through building -> live/failed.
+	DeploymentID string `json:"deploymentId"`
+	// RepoURL is the https git repository to clone.
+	RepoURL string `json:"repoUrl"`
+	// Branch to build.
+	Branch string `json:"branch"`
+	// GitSha is a short revision label; a change rolls the build.
+	GitSha string `json:"gitSha"`
+	// RootDirectory is the subdirectory to build from, for a monorepo. Empty = root.
+	RootDirectory string `json:"rootDirectory,omitempty"`
+	// StartCommand overrides the start command baked into the image (Nixpacks).
+	StartCommand string `json:"startCommand,omitempty"`
+	// BuildEnvKeys are the build-time env var KEYS; values come from EnvValues.
+	BuildEnvKeys []string `json:"buildEnvKeys,omitempty"`
+	// ImageTag is the local tag the agent must produce and then run.
+	ImageTag string `json:"imageTag"`
+	// Private is true when the repo needs a clone token (delivered via BuildToken).
+	Private bool `json:"private,omitempty"`
 }
 
 // NetworkAttachment is one private-network peering: a two-party bridge shared with
@@ -344,6 +378,10 @@ type VolumeMount struct {
 type WorkloadSecrets struct {
 	WorkloadID string            `json:"workloadId"`
 	Env        map[string]string `json:"env"`
+	// BuildToken is a short-lived git clone token for a private host-built repo. Used
+	// only to clone the source for the build, then discarded; never injected into the
+	// running container. Empty for public repos and non host-built workloads.
+	BuildToken string `json:"buildToken,omitempty"`
 }
 
 // SecretsResponse is the out-of-band secrets document for a host, returned by
@@ -406,6 +444,23 @@ type ContainerHealth struct {
 	// Logs are the container output lines produced since the last report
 	// (incremental, may be empty).
 	Logs []LogLine `json:"logs"`
+	// Build, when set, reports host-side build progress for a bring-your-own-host Egg
+	// the agent is building locally, so the control plane can move the Deployment
+	// through building -> live/failed and show the build output in the Build tab. Nil
+	// for a normal (non host-built) workload.
+	Build *BuildReport `json:"build,omitempty"`
+}
+
+// BuildReport is host-side build progress for a workload the agent is building
+// locally. Distinct from the runtime Logs above: this drives the Deployment's build
+// status and the dashboard Build tab.
+type BuildReport struct {
+	// DeploymentID is the deployment this build produces (from the build directive).
+	DeploymentID string `json:"deploymentId"`
+	// Status is the build phase: "building", "built" or "failed".
+	Status string `json:"status"`
+	// Log is incremental, redacted build output since the last report (may be empty).
+	Log string `json:"log,omitempty"`
 }
 
 // LogLine is one line of container output, shipped incrementally by the agent.

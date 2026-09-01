@@ -49,6 +49,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/RuustRun/agent/internal/build"
 	"github.com/RuustRun/agent/internal/cgroups"
 	"github.com/RuustRun/agent/internal/contract"
 	"github.com/RuustRun/agent/internal/docker"
@@ -128,6 +129,7 @@ func main() {
 		log:     log,
 		logs:    logs,
 		ingress: ingress.New(cfg.caddyAdminURL, cfg.upstreamHost, cfg.askEndpoint, cfg.localTLS, log),
+		builder: build.New(),
 	}
 
 	// Serve the on-demand TLS ask endpoint that Caddy calls before issuing a
@@ -155,6 +157,16 @@ type agent struct {
 	log     *slog.Logger
 	logs    *logRing
 	ingress *ingress.Reconciler
+
+	// builder builds host-placement (BYO) Egg images locally, so the customer's
+	// source and build never leave their own machine.
+	builder *build.Builder
+	// Set each tick by the host-side build phase and consumed by reportStatus: the
+	// build report to ship for a workload, plus (for one still building or failed)
+	// the identity to synthesise a container health entry when there is no container
+	// yet. Reset at the start of every tick.
+	buildReports  map[string]*contract.BuildReport
+	pendingBuilds map[string]pendingBuild
 
 	// appliedVersion is the last desired-state version the agent successfully
 	// converged to. It lets the agent no-op cheaply whilst the hash is unchanged.
@@ -419,15 +431,25 @@ func (a *agent) tick(ctx context.Context) {
 	// Fetch the out-of-band secrets and attach the decrypted env to each workload
 	// before converging, so Create injects them. A secrets failure must not stop
 	// reconciliation: log and proceed. Values are never logged.
-	if secrets, serr := a.fetchSecrets(ctx); serr != nil {
+	if secrets, tokens, serr := a.fetchSecrets(ctx); serr != nil {
 		a.log.Warn("could not fetch secrets, proceeding without updated env", "err", serr)
 	} else {
 		for i := range desired.Workloads {
 			if env, ok := secrets[desired.Workloads[i].ID]; ok {
 				desired.Workloads[i].EnvValues = env
 			}
+			if tok, ok := tokens[desired.Workloads[i].ID]; ok {
+				desired.Workloads[i].BuildToken = tok
+			}
 		}
 	}
+
+	// Host-side build phase (bring your own host). For any workload whose image the
+	// control plane asked us to build locally, ensure it is built (async) before it
+	// can run. A workload still building, or whose build failed, is held out of the
+	// reconcile below since there is nothing to run yet; its build progress is
+	// reported on the status endpoint.
+	desired.Workloads = a.runHostBuilds(ctx, desired.Workloads)
 
 	// Reconcile actual against desired on EVERY tick, not only when the desired
 	// version changes. The version hash tells us when the control plane has moved
@@ -527,34 +549,76 @@ func (a *agent) fetchDesiredState(ctx context.Context) (contract.DesiredState, b
 	return desired, changed, nil
 }
 
+// pendingBuild is the identity of a host-built workload that has no container yet
+// (still building, or its build failed), so reportStatus can synthesise a health
+// entry to carry the build report.
+type pendingBuild struct {
+	blobID string
+	state  contract.ContainerState
+}
+
+// runHostBuilds ensures the local image for every host-built (BYO) workload before
+// it can run. It returns the workloads that are ready to reconcile now: those with
+// no build directive, plus those whose image is already built. Workloads still
+// building or whose build failed are held back (nothing to run yet) and their
+// progress is recorded for the next status report. Resets the per-tick build state.
+func (a *agent) runHostBuilds(ctx context.Context, workloads []contract.WorkloadSpec) []contract.WorkloadSpec {
+	a.buildReports = map[string]*contract.BuildReport{}
+	a.pendingBuilds = map[string]pendingBuild{}
+
+	ready := make([]contract.WorkloadSpec, 0, len(workloads))
+	for _, w := range workloads {
+		if w.Build == nil {
+			ready = append(ready, w)
+			continue
+		}
+		built, report := a.builder.Ensure(ctx, w.Build, w.EnvValues, w.BuildToken)
+		if report != nil {
+			a.buildReports[w.ID] = report
+		}
+		if built {
+			ready = append(ready, w) // image present locally: run it on the normal path
+			continue
+		}
+		state := contract.StateBuilding
+		if report != nil && report.Status == "failed" {
+			state = contract.StateCrashed
+		}
+		a.pendingBuilds[w.ID] = pendingBuild{blobID: w.BlobID, state: state}
+	}
+	return ready
+}
+
 // fetchSecrets performs GET /api/v1/hosts/:id/secrets and returns the decrypted
-// env per workload as "KEY=VALUE" lines. This is the out-of-band half of secret
-// delivery; the values are injected into containers and never logged.
-func (a *agent) fetchSecrets(ctx context.Context) (map[string][]string, error) {
+// env per workload as "KEY=VALUE" lines, plus any short-lived git clone token for a
+// private host-built repo. This is the out-of-band half of secret delivery; the
+// values and token are used and never logged.
+func (a *agent) fetchSecrets(ctx context.Context) (map[string][]string, map[string]string, error) {
 	url := fmt.Sprintf("%s/api/%s/hosts/%s/secrets", strings.TrimRight(a.cfg.controlPlaneURL, "/"), contract.APIVersion, a.cfg.hostID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	a.authorise(req)
 
 	resp, err := a.http.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return nil, fmt.Errorf("secrets returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, nil, fmt.Errorf("secrets returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	var sr contract.SecretsResponse
 	if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
-		return nil, fmt.Errorf("decoding secrets: %w", err)
+		return nil, nil, fmt.Errorf("decoding secrets: %w", err)
 	}
 
 	out := make(map[string][]string, len(sr.Workloads))
+	tokens := make(map[string]string)
 	for _, w := range sr.Workloads {
 		lines := make([]string, 0, len(w.Env))
 		for k, v := range w.Env {
@@ -562,8 +626,11 @@ func (a *agent) fetchSecrets(ctx context.Context) (map[string][]string, error) {
 		}
 		sort.Strings(lines) // deterministic order so Create is stable
 		out[w.WorkloadID] = lines
+		if w.BuildToken != "" {
+			tokens[w.WorkloadID] = w.BuildToken
+		}
 	}
-	return out, nil
+	return out, tokens, nil
 }
 
 // reportStatus performs POST /api/v1/hosts/:id/status with per-container health,
@@ -615,6 +682,32 @@ func (a *agent) reportStatus(ctx context.Context, appliedVersion string) {
 			DiskBytes:    a.measureDisk(ctx, c.ID),
 			Logs:         logs,
 		})
+	}
+
+	// Host-side build reports. When the built container is already running, the
+	// report rides on its existing health entry; when it is still building or its
+	// build failed there is no container, so synthesise a health entry to carry the
+	// report and the mapped lifecycle. Cleared after use so a report without a fresh
+	// tick does not resend.
+	if len(a.buildReports) > 0 {
+		for i := range health {
+			if r, ok := a.buildReports[health[i].WorkloadID]; ok {
+				health[i].Build = r
+				delete(a.buildReports, health[i].WorkloadID)
+			}
+		}
+		for wid, r := range a.buildReports {
+			pb := a.pendingBuilds[wid]
+			health = append(health, contract.ContainerHealth{
+				WorkloadID: wid,
+				BlobID:     pb.blobID,
+				State:      pb.state,
+				Usage:      contract.CgroupUsage{},
+				Build:      r,
+			})
+		}
+		a.buildReports = nil
+		a.pendingBuilds = nil
 	}
 
 	// Detect the host's real capacity every heartbeat, so a resized VPS is picked
