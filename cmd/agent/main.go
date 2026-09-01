@@ -566,6 +566,17 @@ func (a *agent) runHostBuilds(ctx context.Context, workloads []contract.Workload
 	a.buildReports = map[string]*contract.BuildReport{}
 	a.pendingBuilds = map[string]pendingBuild{}
 
+	// The image currently serving each workload, so a rebuild can keep the old
+	// container up until the new image finishes building (no downtime). Best effort.
+	serving := map[string]string{}
+	if actual, err := a.docker.List(ctx); err == nil {
+		for _, c := range actual {
+			if c.State == contract.StateRunning || c.State == contract.StateStarting {
+				serving[c.WorkloadID] = c.ImageRef
+			}
+		}
+	}
+
 	ready := make([]contract.WorkloadSpec, 0, len(workloads))
 	for _, w := range workloads {
 		if w.Build == nil {
@@ -578,6 +589,17 @@ func (a *agent) runHostBuilds(ctx context.Context, workloads []contract.Workload
 		}
 		if built {
 			ready = append(ready, w) // image present locally: run it on the normal path
+			continue
+		}
+		// New image not ready yet. If an old container is already serving this
+		// workload (a rebuild), keep it running on its current image until the build
+		// finishes, so there is no downtime. Otherwise (an initial deploy) hold the
+		// workload back until the image exists.
+		if img, ok := serving[w.ID]; ok && img != w.Build.ImageTag {
+			kept := w
+			kept.ImageRef = img
+			kept.Build = nil
+			ready = append(ready, kept)
 			continue
 		}
 		state := contract.StateBuilding
