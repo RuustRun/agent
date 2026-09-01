@@ -36,6 +36,9 @@ const nixpacksVersion = "1.29.1"
 type Builder struct {
 	mu   sync.Mutex
 	jobs map[string]*job
+	// Registry hosts this process has already logged in to (dedicated build host,
+	// pushing built images). Keyed by host so a re-login is skipped per build.
+	loggedIn map[string]bool
 }
 
 type job struct {
@@ -47,7 +50,7 @@ type job struct {
 }
 
 // New returns an empty Builder.
-func New() *Builder { return &Builder{jobs: map[string]*job{}} }
+func New() *Builder { return &Builder{jobs: map[string]*job{}, loggedIn: map[string]bool{}} }
 
 // Ensure makes sure the directive's ImageTag exists locally, building it in the
 // background when it does not. It returns whether the image is ready to run and,
@@ -109,7 +112,11 @@ func (b *Builder) Ensure(ctx context.Context, d *contract.BuildDirective, envVal
 // run performs one build to completion in its own goroutine, streaming redacted
 // output into the job's log and setting the terminal status.
 func (b *Builder) run(ctx context.Context, d *contract.BuildDirective, envValues []string, cloneToken string, j *job) {
-	redact := redactor(cloneToken, envValues)
+	// A build host reads its registry push credential from the environment (set by
+	// provisioning, never in the image). Redact it from the log as a backstop, even
+	// though docker login reads it on stdin and never echoes it.
+	_, _, regPass := registryCreds(d.PushTo)
+	redact := redactor(cloneToken, append(envValues, "PUSH="+regPass))
 	appendLog := func(s string) {
 		j.mu.Lock()
 		j.log.WriteString(redact(s))
@@ -188,9 +195,82 @@ func (b *Builder) run(ctx context.Context, d *contract.BuildDirective, envValues
 	}
 
 	appendLog(fmt.Sprintf("[build] built %s\n", d.ImageTag))
+
+	// Dedicated build host: push the built image to the private registry so a
+	// workload host can pull it. The build succeeds only once the push does, so the
+	// control plane never flips a deployment live against an image that is not in the
+	// registry. Bring-your-own-host has no PushTo and runs the local tag instead.
+	if d.PushTo != "" {
+		if err := b.pushImage(ctx, d, env, appendLog); err != nil {
+			fail("registry push failed: " + err.Error())
+			return
+		}
+	}
+
 	j.mu.Lock()
 	j.status = "built"
 	j.mu.Unlock()
+}
+
+// pushImage tags the freshly built image to the registry reference and pushes it,
+// logging in to the registry first (once per host). The registry credential comes
+// from the environment and is fed to docker login on stdin, so it never appears in
+// the process args or the build log.
+func (b *Builder) pushImage(ctx context.Context, d *contract.BuildDirective, env []string, appendLog func(string)) error {
+	host, user, pass := registryCreds(d.PushTo)
+	if host == "" || user == "" || pass == "" {
+		return fmt.Errorf("registry credentials are not configured on this build host")
+	}
+	if err := b.ensureRegistryLogin(ctx, env, host, user, pass, appendLog); err != nil {
+		return err
+	}
+	if err := runCmd(ctx, "", env, appendLog, "docker", "tag", d.ImageTag, d.PushTo); err != nil {
+		return fmt.Errorf("docker tag: %w", err)
+	}
+	appendLog(fmt.Sprintf("[deploy] pushing %s\n", d.PushTo))
+	if err := runCmd(ctx, "", env, appendLog, "docker", "push", d.PushTo); err != nil {
+		return fmt.Errorf("docker push: %w", err)
+	}
+	appendLog(fmt.Sprintf("[deploy] pushed %s\n", d.PushTo))
+	return nil
+}
+
+// ensureRegistryLogin logs in to the registry host once per process, feeding the
+// password on stdin (never an arg, never logged). Uses the build env so the auth is
+// written to the same DOCKER_CONFIG the subsequent push reads.
+func (b *Builder) ensureRegistryLogin(ctx context.Context, env []string, host, user, pass string, appendLog func(string)) error {
+	b.mu.Lock()
+	already := b.loggedIn[host]
+	b.mu.Unlock()
+	if already {
+		return nil
+	}
+
+	appendLog("[deploy] authenticating to the registry\n")
+	cmd := exec.CommandContext(ctx, "docker", "login", host, "-u", user, "--password-stdin")
+	cmd.Env = env
+	cmd.Stdin = strings.NewReader(pass)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		// docker login does not echo the password, so its output is safe to surface.
+		return fmt.Errorf("docker login: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+
+	b.mu.Lock()
+	b.loggedIn[host] = true
+	b.mu.Unlock()
+	return nil
+}
+
+// registryCreds returns the push registry host, user and password for a build host.
+// The host is derived from the push reference (everything before the first slash),
+// with RUUST_REGISTRY as a fallback; the credentials come from the environment.
+func registryCreds(pushTo string) (host, user, pass string) {
+	host = strings.TrimRight(os.Getenv("RUUST_REGISTRY"), "/")
+	if i := strings.IndexByte(pushTo, '/'); i > 0 {
+		host = pushTo[:i]
+	}
+	return host, os.Getenv("RUUST_REGISTRY_PUSH_USER"), os.Getenv("RUUST_REGISTRY_PUSH_PASS")
 }
 
 // imageExists returns true when the tag is present in the local Docker image store.

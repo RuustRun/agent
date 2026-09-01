@@ -292,8 +292,13 @@ type BuildDirective struct {
 	StartCommand string `json:"startCommand,omitempty"`
 	// BuildEnvKeys are the build-time env var KEYS; values come from EnvValues.
 	BuildEnvKeys []string `json:"buildEnvKeys,omitempty"`
-	// ImageTag is the local tag the agent must produce and then run.
+	// ImageTag is the local tag the agent must produce (and, for BYO, then run).
 	ImageTag string `json:"imageTag"`
+	// PushTo, when set, makes this a BUILD-ONLY job on a dedicated build host: the
+	// agent builds ImageTag, tags it to PushTo, pushes it to the private registry,
+	// and does NOT run a container. Empty = bring-your-own-host (build and run
+	// locally, nothing pushed).
+	PushTo string `json:"pushTo,omitempty"`
 	// Private is true when the repo needs a clone token (delivered via BuildToken).
 	Private bool `json:"private,omitempty"`
 }

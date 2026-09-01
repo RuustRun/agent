@@ -587,6 +587,19 @@ func (a *agent) runHostBuilds(ctx context.Context, workloads []contract.Workload
 		if report != nil {
 			a.buildReports[w.ID] = report
 		}
+		// Build-only job (dedicated build host): build and push the image, but never
+		// run a container here. Always record progress so the control plane can flip
+		// the deployment; never add it to the run set.
+		if w.Build.PushTo != "" {
+			state := contract.StateBuilding
+			if report != nil && report.Status == "failed" {
+				state = contract.StateCrashed
+			} else if built {
+				state = contract.StateStopped // built and pushed; a build host runs nothing
+			}
+			a.pendingBuilds[w.ID] = pendingBuild{blobID: w.BlobID, state: state}
+			continue
+		}
 		if built {
 			ready = append(ready, w) // image present locally: run it on the normal path
 			continue
