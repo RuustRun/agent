@@ -75,6 +75,13 @@ type config struct {
 	// Ingress: the local Caddy admin API, where the agent serves the on-demand
 	// TLS ask endpoint, how Caddy reaches Egg containers, and the ask URL Caddy
 	// calls (reachable from the Caddy container).
+	//
+	// ingressEnabled gates all of it: only a node provisioned as an ingress node
+	// (RUUST_CADDY_ADMIN explicitly set, which enroll-node.sh does only under
+	// RUUST_WITH_INGRESS) runs Caddy. A workload or build host never terminates
+	// ingress, so it must not try to configure a Caddy that is not there (which
+	// would log a connection-refused every tick forever).
+	ingressEnabled bool
 	caddyAdminURL  string
 	ingressAskAddr string
 	upstreamHost   string
@@ -133,15 +140,18 @@ func main() {
 	}
 
 	// Serve the on-demand TLS ask endpoint that Caddy calls before issuing a
-	// certificate. It runs for the life of the agent; a failure to bind is logged
-	// but not fatal (ingress just will not issue new certs until it is reachable).
-	go func() {
-		mux := http.NewServeMux()
-		mux.HandleFunc("/ask", a.ingress.AskHandler())
-		if err := http.ListenAndServe(cfg.ingressAskAddr, mux); err != nil {
-			log.Warn("ingress ask endpoint stopped", "err", err)
-		}
-	}()
+	// certificate. Only an ingress node runs it; a workload or build host has no
+	// Caddy to call it, so it never binds the port. A failure to bind is logged but
+	// not fatal (ingress just will not issue new certs until it is reachable).
+	if cfg.ingressEnabled {
+		go func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/ask", a.ingress.AskHandler())
+			if err := http.ListenAndServe(cfg.ingressAskAddr, mux); err != nil {
+				log.Warn("ingress ask endpoint stopped", "err", err)
+			}
+		}()
+	}
 
 	a.run(ctx)
 	log.Info("Ruust agent stopped")
@@ -483,32 +493,37 @@ func (a *agent) tick(ctx context.Context) {
 	// bind ephemeral host ports the control plane does not know in advance, so we read
 	// the live ports back from Docker rather than trusting the spec. A failure here
 	// must not stop the workload loop; it is logged and retried.
-	actual, lerr := a.docker.List(ctx)
-	if lerr != nil {
-		a.log.Warn("could not list containers for ingress", "err", lerr)
-	} else {
-		portsByWorkload := make(map[string][]int)
-		for _, c := range actual {
-			// Only route to a replica that is up AND passing its health check (List
-			// reports a running-but-unhealthy container as Starting, so Running means
-			// healthy). This is what makes a roll zero-downtime: a still-booting new
-			// replica is not an upstream until it is healthy, and the old healthy
-			// replica keeps serving until then, so requests never hit a dead or
-			// not-yet-ready backend.
-			if c.PublishedPort > 0 && c.State == contract.StateRunning {
-				portsByWorkload[c.WorkloadID] = append(portsByWorkload[c.WorkloadID], c.PublishedPort)
-			}
-		}
-		routes := make([]ingress.Route, 0, len(desired.Workloads))
-		for _, w := range desired.Workloads {
-			if w.PublishPort > 0 && len(w.Hostnames) > 0 {
-				if ports := portsByWorkload[w.ID]; len(ports) > 0 {
-					routes = append(routes, ingress.Route{Hostnames: w.Hostnames, UpstreamPorts: ports})
+	//
+	// Only an ingress node does this: a workload or build host runs no Caddy, so it
+	// must not try to configure one (that would log a connection-refused every tick).
+	if a.cfg.ingressEnabled {
+		actual, lerr := a.docker.List(ctx)
+		if lerr != nil {
+			a.log.Warn("could not list containers for ingress", "err", lerr)
+		} else {
+			portsByWorkload := make(map[string][]int)
+			for _, c := range actual {
+				// Only route to a replica that is up AND passing its health check (List
+				// reports a running-but-unhealthy container as Starting, so Running means
+				// healthy). This is what makes a roll zero-downtime: a still-booting new
+				// replica is not an upstream until it is healthy, and the old healthy
+				// replica keeps serving until then, so requests never hit a dead or
+				// not-yet-ready backend.
+				if c.PublishedPort > 0 && c.State == contract.StateRunning {
+					portsByWorkload[c.WorkloadID] = append(portsByWorkload[c.WorkloadID], c.PublishedPort)
 				}
 			}
-		}
-		if err := a.ingress.Reconcile(ctx, routes); err != nil {
-			a.log.Warn("could not reconcile ingress", "err", err)
+			routes := make([]ingress.Route, 0, len(desired.Workloads))
+			for _, w := range desired.Workloads {
+				if w.PublishPort > 0 && len(w.Hostnames) > 0 {
+					if ports := portsByWorkload[w.ID]; len(ports) > 0 {
+						routes = append(routes, ingress.Route{Hostnames: w.Hostnames, UpstreamPorts: ports})
+					}
+				}
+			}
+			if err := a.ingress.Reconcile(ctx, routes); err != nil {
+				a.log.Warn("could not reconcile ingress", "err", err)
+			}
 		}
 	}
 
@@ -856,10 +871,12 @@ func loadConfig() (config, error) {
 		region:          os.Getenv("RUUST_REGION"),
 		pollInterval:    durationEnv("RUUST_POLL_INTERVAL", 10*time.Second),
 		pollJitter:      durationEnv("RUUST_POLL_JITTER", 3*time.Second),
-		caddyAdminURL:   envOr("RUUST_CADDY_ADMIN", "http://localhost:2019"),
-		ingressAskAddr:  envOr("RUUST_INGRESS_ASK_ADDR", ":9700"),
-		upstreamHost:    envOr("RUUST_UPSTREAM_HOST", "host.docker.internal"),
-		askEndpoint:     envOr("RUUST_ASK_ENDPOINT", "http://host.docker.internal:9700/ask"),
+		// An ingress node has RUUST_CADDY_ADMIN set; anything else runs no Caddy.
+		ingressEnabled: os.Getenv("RUUST_CADDY_ADMIN") != "",
+		caddyAdminURL:  envOr("RUUST_CADDY_ADMIN", "http://localhost:2019"),
+		ingressAskAddr: envOr("RUUST_INGRESS_ASK_ADDR", ":9700"),
+		upstreamHost:   envOr("RUUST_UPSTREAM_HOST", "host.docker.internal"),
+		askEndpoint:    envOr("RUUST_ASK_ENDPOINT", "http://host.docker.internal:9700/ask"),
 		// Production uses Let's Encrypt; set RUUST_INGRESS_LOCAL_TLS=1 for a local
 		// single-box setup that must fall back to Caddy's internal self-signed CA.
 		localTLS: os.Getenv("RUUST_INGRESS_LOCAL_TLS") == "1",
