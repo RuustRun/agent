@@ -260,6 +260,10 @@ type WorkloadSpec struct {
 	// your own host) before running it, so the customer's code never leaves the box.
 	// Nil for a normal, already-built or registry-pulled workload. See BuildDirective.
 	Build *BuildDirective `json:"build,omitempty"`
+	// Import, when set, is a one-off data import into this database Egg from an
+	// external Postgres source (pg_dump piped into the Egg's own container). Nil when
+	// there is no active import. See ImportDirective.
+	Import *ImportDirective `json:"import,omitempty"`
 	// Limits are the hard resource limits enforced by the agent.
 	Limits ResourceLimits `json:"limits"`
 	// EnvValues is the decrypted env as "KEY=VALUE" lines, populated locally by the
@@ -270,6 +274,10 @@ type WorkloadSpec struct {
 	// populated locally from the secrets endpoint. Never on the wire (json:"-"),
 	// never logged, and never injected into the running container.
 	BuildToken string `json:"-"`
+	// ImportSourceURL is the external Postgres source connection string for an
+	// in-progress data import, populated locally from the secrets endpoint. Never on
+	// the wire (json:"-"), never logged, passed to the import as an env var not argv.
+	ImportSourceURL string `json:"-"`
 }
 
 // BuildDirective tells a bring-your-own-host agent to build a workload's image from
@@ -301,6 +309,18 @@ type BuildDirective struct {
 	PushTo string `json:"pushTo,omitempty"`
 	// Private is true when the repo needs a clone token (delivered via BuildToken).
 	Private bool `json:"private,omitempty"`
+}
+
+// ImportDirective tells the agent to load data into a database Egg from an external
+// source: pg_dump of the source (ImportSourceURL, from secrets) piped into the Egg's
+// own running container, so the data never leaves the host. Progress is reported on
+// the status endpoint. The agent runs a given ImportID only once per process.
+type ImportDirective struct {
+	// ImportID is echoed back on the status report so the control plane can move the
+	// right Import through importing -> done/failed.
+	ImportID string `json:"importId"`
+	// Engine is the database engine ("postgres"), so the agent picks the right tool.
+	Engine string `json:"engine"`
 }
 
 // NetworkAttachment is one private-network peering: a two-party bridge shared with
@@ -387,6 +407,10 @@ type WorkloadSecrets struct {
 	// only to clone the source for the build, then discarded; never injected into the
 	// running container. Empty for public repos and non host-built workloads.
 	BuildToken string `json:"buildToken,omitempty"`
+	// ImportSourceURL is the external Postgres source connection string for an
+	// in-progress data import. Used only to dump the source; never injected into the
+	// running container's env. Empty when there is no active import.
+	ImportSourceURL string `json:"importSourceUrl,omitempty"`
 }
 
 // SecretsResponse is the out-of-band secrets document for a host, returned by
@@ -454,6 +478,10 @@ type ContainerHealth struct {
 	// through building -> live/failed and show the build output in the Build tab. Nil
 	// for a normal (non host-built) workload.
 	Build *BuildReport `json:"build,omitempty"`
+	// Import, when set, reports data-import progress for a database Egg the agent is
+	// importing into, so the control plane can move the Import through
+	// importing -> done/failed and show progress. Nil when there is no active import.
+	Import *ImportReport `json:"import,omitempty"`
 }
 
 // BuildReport is host-side build progress for a workload the agent is building
@@ -465,6 +493,17 @@ type BuildReport struct {
 	// Status is the build phase: "building", "built" or "failed".
 	Status string `json:"status"`
 	// Log is incremental, redacted build output since the last report (may be empty).
+	Log string `json:"log,omitempty"`
+}
+
+// ImportReport is data-import progress for a database Egg the agent is importing
+// into, driving the Import's status and dashboard progress.
+type ImportReport struct {
+	// ImportID is the import this report is for (from the import directive).
+	ImportID string `json:"importId"`
+	// Status is the import phase: "importing", "done" or "failed".
+	Status string `json:"status"`
+	// Log is incremental, redacted import output since the last report (may be empty).
 	Log string `json:"log,omitempty"`
 }
 

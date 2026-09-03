@@ -52,6 +52,7 @@ import (
 	"github.com/RuustRun/agent/internal/build"
 	"github.com/RuustRun/agent/internal/cgroups"
 	"github.com/RuustRun/agent/internal/contract"
+	"github.com/RuustRun/agent/internal/dbimport"
 	"github.com/RuustRun/agent/internal/docker"
 	"github.com/RuustRun/agent/internal/hostcap"
 	"github.com/RuustRun/agent/internal/hostfacts"
@@ -128,15 +129,16 @@ func main() {
 	defer stop()
 
 	a := &agent{
-		cfg:     cfg,
-		docker:  dcli,
-		http:    &http.Client{Timeout: 15 * time.Second},
-		migHTTP: &http.Client{Timeout: 10 * time.Minute},
-		stats:   cgroups.NewReader(),
-		log:     log,
-		logs:    logs,
-		ingress: ingress.New(cfg.caddyAdminURL, cfg.upstreamHost, cfg.askEndpoint, cfg.localTLS, log),
-		builder: build.New(),
+		cfg:      cfg,
+		docker:   dcli,
+		http:     &http.Client{Timeout: 15 * time.Second},
+		migHTTP:  &http.Client{Timeout: 10 * time.Minute},
+		stats:    cgroups.NewReader(),
+		log:      log,
+		logs:     logs,
+		ingress:  ingress.New(cfg.caddyAdminURL, cfg.upstreamHost, cfg.askEndpoint, cfg.localTLS, log),
+		builder:  build.New(),
+		importer: dbimport.New(),
 	}
 
 	// Serve the on-demand TLS ask endpoint that Caddy calls before issuing a
@@ -177,6 +179,12 @@ type agent struct {
 	// yet. Reset at the start of every tick.
 	buildReports  map[string]*contract.BuildReport
 	pendingBuilds map[string]pendingBuild
+
+	// importer runs one-off data imports into a database Egg's own container
+	// (pg_dump of an external source piped into the Egg's local psql). importReports
+	// is set each tick and consumed by reportStatus, keyed by workload id.
+	importer      *dbimport.Importer
+	importReports map[string]*contract.ImportReport
 
 	// appliedVersion is the last desired-state version the agent successfully
 	// converged to. It lets the agent no-op cheaply whilst the hash is unchanged.
@@ -441,7 +449,7 @@ func (a *agent) tick(ctx context.Context) {
 	// Fetch the out-of-band secrets and attach the decrypted env to each workload
 	// before converging, so Create injects them. A secrets failure must not stop
 	// reconciliation: log and proceed. Values are never logged.
-	if secrets, tokens, serr := a.fetchSecrets(ctx); serr != nil {
+	if secrets, tokens, importURLs, serr := a.fetchSecrets(ctx); serr != nil {
 		a.log.Warn("could not fetch secrets, proceeding without updated env", "err", serr)
 	} else {
 		for i := range desired.Workloads {
@@ -450,6 +458,9 @@ func (a *agent) tick(ctx context.Context) {
 			}
 			if tok, ok := tokens[desired.Workloads[i].ID]; ok {
 				desired.Workloads[i].BuildToken = tok
+			}
+			if src, ok := importURLs[desired.Workloads[i].ID]; ok {
+				desired.Workloads[i].ImportSourceURL = src
 			}
 		}
 	}
@@ -486,6 +497,11 @@ func (a *agent) tick(ctx context.Context) {
 	// and idempotent: a failure is reported and retried next tick, and never blocks
 	// the rest of the loop.
 	a.handleMigrations(ctx, desired)
+
+	// Data imports, if any. Run AFTER converge so the target database container is up
+	// (an import loads into a running container). Async and idempotent: each import id
+	// runs once per process and progress is reported on the status endpoint.
+	a.runImports(ctx, desired.Workloads)
 
 	// Reconcile ingress: for every Egg that is published (a web Egg, PublishPort > 0)
 	// and has at least one hostname, register a Caddy route that load-balances across
@@ -639,36 +655,71 @@ func (a *agent) runHostBuilds(ctx context.Context, workloads []contract.Workload
 	return ready
 }
 
+// runImports processes any pending data imports for database Eggs on this host. For
+// each workload carrying an import directive and a source URL, once its container is
+// running, it starts (or continues) the async import and records the progress report
+// for reportStatus to ship. The target database must be up (an import loads into a
+// running container), so a workload still starting is skipped this tick and retried.
+func (a *agent) runImports(ctx context.Context, workloads []contract.WorkloadSpec) {
+	a.importReports = map[string]*contract.ImportReport{}
+
+	// The running container for each workload, so we exec into the right one.
+	running := map[string]string{} // workloadID -> containerID
+	if actual, err := a.docker.List(ctx); err == nil {
+		for _, c := range actual {
+			if c.State == contract.StateRunning {
+				running[c.WorkloadID] = c.ID
+			}
+		}
+	}
+
+	for _, w := range workloads {
+		if w.Import == nil || w.ImportSourceURL == "" {
+			continue
+		}
+		cID, ok := running[w.ID]
+		if !ok {
+			continue // container not up yet; retry next tick once it is running
+		}
+		_, report := a.importer.Ensure(ctx, cID, w.Import, w.ImportSourceURL)
+		if report != nil {
+			a.importReports[w.ID] = report
+		}
+	}
+}
+
 // fetchSecrets performs GET /api/v1/hosts/:id/secrets and returns the decrypted
-// env per workload as "KEY=VALUE" lines, plus any short-lived git clone token for a
-// private host-built repo. This is the out-of-band half of secret delivery; the
-// values and token are used and never logged.
-func (a *agent) fetchSecrets(ctx context.Context) (map[string][]string, map[string]string, error) {
+// env per workload as "KEY=VALUE" lines, any short-lived git clone token for a
+// private host-built repo, and any external source connection string for an
+// in-progress data import. This is the out-of-band half of secret delivery; the
+// values, token and source URL are used and never logged.
+func (a *agent) fetchSecrets(ctx context.Context) (map[string][]string, map[string]string, map[string]string, error) {
 	url := fmt.Sprintf("%s/api/%s/hosts/%s/secrets", strings.TrimRight(a.cfg.controlPlaneURL, "/"), contract.APIVersion, a.cfg.hostID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	a.authorise(req)
 
 	resp, err := a.http.Do(req)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return nil, nil, fmt.Errorf("secrets returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, nil, nil, fmt.Errorf("secrets returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	var sr contract.SecretsResponse
 	if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
-		return nil, nil, fmt.Errorf("decoding secrets: %w", err)
+		return nil, nil, nil, fmt.Errorf("decoding secrets: %w", err)
 	}
 
 	out := make(map[string][]string, len(sr.Workloads))
 	tokens := make(map[string]string)
+	importURLs := make(map[string]string)
 	for _, w := range sr.Workloads {
 		lines := make([]string, 0, len(w.Env))
 		for k, v := range w.Env {
@@ -679,8 +730,11 @@ func (a *agent) fetchSecrets(ctx context.Context) (map[string][]string, map[stri
 		if w.BuildToken != "" {
 			tokens[w.WorkloadID] = w.BuildToken
 		}
+		if w.ImportSourceURL != "" {
+			importURLs[w.WorkloadID] = w.ImportSourceURL
+		}
 	}
-	return out, tokens, nil
+	return out, tokens, importURLs, nil
 }
 
 // reportStatus performs POST /api/v1/hosts/:id/status with per-container health,
@@ -758,6 +812,19 @@ func (a *agent) reportStatus(ctx context.Context, appliedVersion string) {
 		}
 		a.buildReports = nil
 		a.pendingBuilds = nil
+	}
+
+	// Data-import reports. The import loads into a RUNNING container, so its report
+	// always rides on that container's existing health entry (no synthetic entry
+	// needed). Cleared after use so a report without a fresh tick does not resend.
+	if len(a.importReports) > 0 {
+		for i := range health {
+			if r, ok := a.importReports[health[i].WorkloadID]; ok {
+				health[i].Import = r
+				delete(a.importReports, health[i].WorkloadID)
+			}
+		}
+		a.importReports = nil
 	}
 
 	// Detect the host's real capacity every heartbeat, so a resized VPS is picked
