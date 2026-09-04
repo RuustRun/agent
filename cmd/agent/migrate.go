@@ -257,6 +257,64 @@ func (a *agent) downloadSnapshot(ctx context.Context, m *contract.MigrationDirec
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
+// backupRelayURL builds this host's Vault-backup staging endpoint for a relay id. The
+// control plane never needs to know its own public URL; the agent constructs it from
+// its configured control-plane URL, exactly like the migration relay fallback.
+func (a *agent) backupRelayURL(relayID, verb string) string {
+	return fmt.Sprintf("%s/api/%s/hosts/%s/vault-backup/%s/%s",
+		strings.TrimRight(a.cfg.controlPlaneURL, "/"), contract.APIVersion, a.cfg.hostID, relayID, verb)
+}
+
+// backupUpload PUTs a snapshot's bytes to the control-plane staging endpoint for a
+// relay id, host-token authorised, for relay to a Vault (or a fetch back for a
+// restore).
+func (a *agent) backupUpload(ctx context.Context, relayID string, body io.Reader, size int64) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, a.backupRelayURL(relayID, "upload"), body)
+	if err != nil {
+		return err
+	}
+	if size > 0 {
+		req.ContentLength = size
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	a.authorise(req)
+	resp, err := a.migHTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("upload returned %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	return nil
+}
+
+// backupDownload GETs a staged snapshot for a relay id into dst, host-token
+// authorised, returning its sha256 so the caller can verify the recorded checksum.
+func (a *agent) backupDownload(ctx context.Context, relayID string, dst io.Writer) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.backupRelayURL(relayID, "download"), nil)
+	if err != nil {
+		return "", err
+	}
+	a.authorise(req)
+	resp, err := a.migHTTP.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", fmt.Errorf("download returned %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	hash := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(dst, hash), resp.Body); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
 // reportMigration POSTs a progress report to the migration-status endpoint. Best
 // effort: a failure is logged and the step is retried on the next tick.
 func (a *agent) reportMigration(ctx context.Context, report contract.MigrationReport) {

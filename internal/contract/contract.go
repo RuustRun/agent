@@ -327,22 +327,39 @@ type ImportDirective struct {
 	Engine string `json:"engine"`
 }
 
-// BackupDirective tells the agent to capture or restore a snapshot of a database
-// Egg. Capture runs pg_dump inside the Egg's container to a durable host file and
-// reports the ref/size/checksum back; restore loads a prior snapshot (Ref) back in.
-// The agent runs a given BackupID only once per process.
+// BackupDirective tells the agent what to do with a database Egg's snapshot. The
+// agent runs a given (BackupID, Action) only once per process.
+//
+//   - capture: run pg_dump inside the Egg's container to a durable host file, report
+//     the ref/size/checksum back.
+//   - restore: load a snapshot (Ref, a local host file, or GetURL for a Vault copy)
+//     back into the Egg's container.
+//   - upload: (source host, durable backups) send the local snapshot at Ref to PutURL
+//     (control-plane staging) so it can be relayed to the Vault.
+//   - store: (Vault host) download the snapshot from GetURL and write it into the
+//     Vault volume at Ref, verifying Checksum.
+//   - fetch: (Vault host, restore) send the Vault copy at Ref to PutURL so the source
+//     host can download and restore it.
 type BackupDirective struct {
 	// BackupID is echoed back on the status report.
 	BackupID string `json:"backupId"`
-	// Action is "capture" or "restore".
+	// Action is "capture", "restore", "upload", "store" or "fetch".
 	Action string `json:"action"`
 	// Engine is the database engine ("postgres").
 	Engine string `json:"engine"`
-	// Ref, for a restore, is the host file (from a prior capture) to load back.
+	// Ref is a file path: the snapshot to restore/upload/fetch, or where to write a
+	// downloaded snapshot in the Vault volume (store).
 	Ref string `json:"ref,omitempty"`
 	// Retention, for a capture, is how many newest snapshots to keep on the host
 	// (older ones are pruned after this capture).
 	Retention int `json:"retention,omitempty"`
+	// PutURL, for upload/fetch, is where to PUT the snapshot bytes (control-plane
+	// staging, authenticated with the host token).
+	PutURL string `json:"putUrl,omitempty"`
+	// GetURL, for store and restore-from-vault, is where to GET the snapshot bytes.
+	GetURL string `json:"getUrl,omitempty"`
+	// Checksum, for store, is the sha256 to verify the downloaded snapshot against.
+	Checksum string `json:"checksum,omitempty"`
 }
 
 // NetworkAttachment is one private-network peering: a two-party bridge shared with
@@ -538,9 +555,14 @@ type ImportReport struct {
 type BackupReport struct {
 	// BackupID is the backup this report is for (from the backup directive).
 	BackupID string `json:"backupId"`
+	// Action is which directive action this report is for ("capture", "restore",
+	// "upload", "store", "fetch"), so the control plane can tell them apart for the
+	// same BackupID.
+	Action string `json:"action,omitempty"`
 	// Status is the backup phase: "running", "done" or "failed".
 	Status string `json:"status"`
-	// Ref, on a capture "done", is the durable host file the snapshot was written to.
+	// Ref, on a capture "done", is the durable host file the snapshot was written to;
+	// on a store "done", the file path written inside the Vault volume.
 	Ref string `json:"ref,omitempty"`
 	// SizeBytes is the snapshot size on a capture "done".
 	SizeBytes int64 `json:"sizeBytes,omitempty"`

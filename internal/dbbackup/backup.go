@@ -32,10 +32,24 @@ import (
 // grants it write access to /var/lib/ruust.
 const backupRoot = "/var/lib/ruust/backups"
 
-// Backuper tracks in-flight captures and restores, one per backup id.
+// Relay moves snapshot bytes to and from the control-plane staging endpoints, so a
+// snapshot can be copied off its host onto a Vault (and fetched back for a restore).
+// The agent supplies these, host-token authorised.
+type Relay struct {
+	// Upload PUTs size bytes from body to the staging endpoint for relayID.
+	Upload func(ctx context.Context, relayID string, body io.Reader, size int64) error
+	// Download GETs the staged bytes for relayID into dst, returning their sha256.
+	Download func(ctx context.Context, relayID string, dst io.Writer) (checksum string, err error)
+}
+
+// Backuper tracks in-flight backup operations, one per (backup id, action). Keying on
+// the action too matters because the SAME backup id flows through several actions on
+// one host (capture then upload on the source; store then fetch on the Vault); a job
+// keyed on the id alone would return a stale "done" for the next action.
 type Backuper struct {
-	mu   sync.Mutex
-	jobs map[string]*job
+	relay Relay
+	mu    sync.Mutex
+	jobs  map[string]*job
 }
 
 type job struct {
@@ -49,18 +63,19 @@ type job struct {
 	reported  bool
 }
 
-// New returns an empty Backuper.
-func New() *Backuper { return &Backuper{jobs: map[string]*job{}} }
+// New returns a Backuper that relays through the given endpoints.
+func New(relay Relay) *Backuper { return &Backuper{relay: relay, jobs: map[string]*job{}} }
 
 // Ensure runs the backup for d.BackupID against the given running container the
 // first time it is seen, then returns incremental progress on every call. blobID
 // locates the on-host snapshot directory. Idempotent and cheap once a job exists.
 func (b *Backuper) Ensure(ctx context.Context, containerID, blobID string, d *contract.BackupDirective) (done bool, report *contract.BackupReport) {
+	key := d.BackupID + ":" + d.Action
 	b.mu.Lock()
-	j, ok := b.jobs[d.BackupID]
+	j, ok := b.jobs[key]
 	if !ok {
 		j = &job{status: "running"}
-		b.jobs[d.BackupID] = j
+		b.jobs[key] = j
 		// Detached context: the job must outlive the tick that started it.
 		go b.run(context.Background(), containerID, blobID, d, j)
 	}
@@ -82,6 +97,7 @@ func (b *Backuper) Ensure(ctx context.Context, containerID, blobID string, d *co
 			j.reported = true
 			return true, &contract.BackupReport{
 				BackupID:  d.BackupID,
+				Action:    d.Action,
 				Status:    "done",
 				Ref:       j.ref,
 				SizeBytes: j.sizeBytes,
@@ -93,11 +109,11 @@ func (b *Backuper) Ensure(ctx context.Context, containerID, blobID string, d *co
 	case "failed":
 		if !j.reported {
 			j.reported = true
-			return true, &contract.BackupReport{BackupID: d.BackupID, Status: "failed", Log: delta}
+			return true, &contract.BackupReport{BackupID: d.BackupID, Action: d.Action, Status: "failed", Log: delta}
 		}
-		return true, &contract.BackupReport{BackupID: d.BackupID, Status: "failed"}
+		return true, &contract.BackupReport{BackupID: d.BackupID, Action: d.Action, Status: "failed"}
 	default: // running
-		return false, &contract.BackupReport{BackupID: d.BackupID, Status: "running", Log: delta}
+		return false, &contract.BackupReport{BackupID: d.BackupID, Action: d.Action, Status: "running", Log: delta}
 	}
 }
 
@@ -114,11 +130,18 @@ func (b *Backuper) run(ctx context.Context, containerID, blobID string, d *contr
 		j.mu.Unlock()
 	}
 
-	if d.Action == "restore" {
+	switch d.Action {
+	case "restore":
 		b.restore(ctx, containerID, d, appendLog, fail, j)
-		return
+	case "upload":
+		b.upload(ctx, d, appendLog, fail, j)
+	case "store":
+		b.store(ctx, containerID, blobID, d, appendLog, fail, j)
+	case "fetch":
+		b.fetch(ctx, containerID, d, appendLog, fail, j)
+	default:
+		b.capture(ctx, containerID, blobID, d, appendLog, fail, j)
 	}
-	b.capture(ctx, containerID, blobID, d, appendLog, fail, j)
 }
 
 // capture streams pg_dump of the Egg's own database (custom format, for pg_restore)
@@ -204,13 +227,34 @@ func (b *Backuper) capture(ctx context.Context, containerID, blobID string, d *c
 	}
 }
 
-// restore loads a previously captured snapshot back into the running container.
+// restore loads a snapshot back into the running container. The snapshot is either a
+// local host file (Ref) from a prior capture, or, when only a durable Vault copy
+// survives, downloaded from the control-plane relay (GetURL) to a temporary file first.
 func (b *Backuper) restore(ctx context.Context, containerID string, d *contract.BackupDirective, appendLog func(string), fail func(string), j *job) {
+	path := d.Ref
 	if d.Ref == "" {
-		fail("restore has no snapshot reference")
-		return
+		// No local file: restore from the Vault. The snapshot was fetched off the Vault
+		// and staged; pull it back onto this host first (relay id is the backup id).
+		if b.relay.Download == nil {
+			fail("no relay configured to fetch the snapshot from the Vault")
+			return
+		}
+		tmp, err := os.CreateTemp("", "ruust-restore-*.dump")
+		if err != nil {
+			fail("could not create a temporary file: " + err.Error())
+			return
+		}
+		defer func() { _ = os.Remove(tmp.Name()) }()
+		appendLog("[restore] fetching the snapshot from the Vault\n")
+		if _, err := b.relay.Download(ctx, d.BackupID, tmp); err != nil {
+			_ = tmp.Close()
+			fail("could not download the snapshot: " + err.Error())
+			return
+		}
+		_ = tmp.Close()
+		path = tmp.Name()
 	}
-	f, err := os.Open(d.Ref)
+	f, err := os.Open(path)
 	if err != nil {
 		fail("could not open the snapshot: " + err.Error())
 		return
@@ -237,6 +281,136 @@ func (b *Backuper) restore(ctx context.Context, containerID string, d *contract.
 		return
 	}
 	appendLog("[restore] done\n")
+	j.mu.Lock()
+	j.status = "done"
+	j.mu.Unlock()
+}
+
+// upload sends a local snapshot (Ref) to the control-plane staging endpoint (PutURL)
+// for relay to a Vault. Runs on the SOURCE host after a capture completes.
+func (b *Backuper) upload(ctx context.Context, d *contract.BackupDirective, appendLog func(string), fail func(string), j *job) {
+	if b.relay.Upload == nil {
+		fail("no relay configured to upload the snapshot")
+		return
+	}
+	if d.Ref == "" {
+		fail("upload is missing the snapshot reference")
+		return
+	}
+	f, err := os.Open(d.Ref)
+	if err != nil {
+		fail("could not open the snapshot to upload: " + err.Error())
+		return
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		fail("could not size the snapshot: " + err.Error())
+		return
+	}
+	appendLog("[vault] uploading the snapshot for durable keeping\n")
+	if err := b.relay.Upload(ctx, d.BackupID, f, info.Size()); err != nil {
+		fail("could not upload the snapshot: " + err.Error())
+		return
+	}
+	appendLog("[vault] uploaded\n")
+	j.mu.Lock()
+	j.status = "done"
+	j.mu.Unlock()
+}
+
+// store downloads a staged snapshot (GetURL) and writes it into the Vault volume via
+// docker cp at Ref, verifying the checksum. Runs on the VAULT host. The Vault image
+// carries no shell, so the file goes in via docker cp rather than an exec.
+func (b *Backuper) store(ctx context.Context, containerID, blobID string, d *contract.BackupDirective, appendLog func(string), fail func(string), j *job) {
+	if b.relay.Download == nil {
+		fail("no relay configured to download the snapshot")
+		return
+	}
+	if d.Ref == "" {
+		fail("store is missing the destination path")
+		return
+	}
+	tmp, err := os.CreateTemp("", "ruust-vault-*.dump")
+	if err != nil {
+		fail("could not create a temporary file: " + err.Error())
+		return
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	appendLog("[vault] receiving the snapshot\n")
+	sum, err := b.relay.Download(ctx, d.BackupID, tmp)
+	if err != nil {
+		_ = tmp.Close()
+		fail("could not download the snapshot: " + err.Error())
+		return
+	}
+	_ = tmp.Close()
+	if d.Checksum != "" && sum != d.Checksum {
+		fail("the received snapshot failed its checksum")
+		return
+	}
+	// Copy the file into the Vault container's volume. docker cp needs no shell in the
+	// target image; Ref is a flat path under the volume mount, which already exists.
+	cp := exec.CommandContext(ctx, "docker", "cp", tmp.Name(), containerID+":"+d.Ref)
+	if out, err := cp.CombinedOutput(); err != nil {
+		if s := strings.TrimSpace(string(out)); s != "" {
+			appendLog(s + "\n")
+		}
+		fail("could not store the snapshot in the Vault: " + err.Error())
+		return
+	}
+	appendLog("[vault] stored\n")
+	j.mu.Lock()
+	j.ref = d.Ref
+	j.status = "done"
+	j.mu.Unlock()
+}
+
+// fetch copies a snapshot back out of the Vault volume (docker cp from Ref) and uploads
+// it to the control-plane staging endpoint (PutURL) so the source host can restore it.
+// Runs on the VAULT host during a restore-from-Vault.
+func (b *Backuper) fetch(ctx context.Context, containerID string, d *contract.BackupDirective, appendLog func(string), fail func(string), j *job) {
+	if b.relay.Upload == nil {
+		fail("no relay configured to upload the snapshot")
+		return
+	}
+	if d.Ref == "" {
+		fail("fetch is missing the snapshot reference")
+		return
+	}
+	tmp, err := os.CreateTemp("", "ruust-vault-fetch-*.dump")
+	if err != nil {
+		fail("could not create a temporary file: " + err.Error())
+		return
+	}
+	tmpName := tmp.Name()
+	_ = tmp.Close()
+	defer func() { _ = os.Remove(tmpName) }()
+	appendLog("[vault] reading the snapshot from the Vault\n")
+	cp := exec.CommandContext(ctx, "docker", "cp", containerID+":"+d.Ref, tmpName)
+	if out, err := cp.CombinedOutput(); err != nil {
+		if s := strings.TrimSpace(string(out)); s != "" {
+			appendLog(s + "\n")
+		}
+		fail("could not read the snapshot from the Vault: " + err.Error())
+		return
+	}
+	f, err := os.Open(tmpName)
+	if err != nil {
+		fail("could not open the fetched snapshot: " + err.Error())
+		return
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		fail("could not size the fetched snapshot: " + err.Error())
+		return
+	}
+	if err := b.relay.Upload(ctx, d.BackupID, f, info.Size()); err != nil {
+		fail("could not upload the fetched snapshot: " + err.Error())
+		return
+	}
+	appendLog("[vault] sent for restore\n")
 	j.mu.Lock()
 	j.status = "done"
 	j.mu.Unlock()

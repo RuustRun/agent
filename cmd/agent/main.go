@@ -140,8 +140,10 @@ func main() {
 		ingress:  ingress.New(cfg.caddyAdminURL, cfg.upstreamHost, cfg.askEndpoint, cfg.localTLS, log),
 		builder:  build.New(),
 		importer: dbimport.New(),
-		backuper: dbbackup.New(),
 	}
+	// The Backuper relays snapshots to and from a Vault through the control-plane
+	// staging endpoints, host-token authorised (see backupUpload/backupDownload).
+	a.backuper = dbbackup.New(dbbackup.Relay{Upload: a.backupUpload, Download: a.backupDownload})
 
 	// Serve the on-demand TLS ask endpoint that Caddy calls before issuing a
 	// certificate. Only an ingress node runs it; a workload or build host has no
