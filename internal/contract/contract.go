@@ -212,9 +212,13 @@ type WorkloadSpec struct {
 	// Port is the container port the workload listens on.
 	Port int `json:"port"`
 	// PublishPort optionally publishes the container Port to this host port, for
-	// local development and demos. Zero (omitted) in production, where the
+	// local development and demos, and for a game-server Egg (which needs a real
+	// public host:port). Zero (omitted) for a plain web Egg in production, where the
 	// ingress tier routes traffic and the agent publishes nothing.
 	PublishPort int `json:"publishPort,omitempty"`
+	// PublishProtocol is the transport to publish PublishPort with: "udp" for a
+	// native game server (FishNet Tugboat), else "tcp" (the default when empty).
+	PublishProtocol string `json:"publishProtocol,omitempty"`
 	// Hostnames this Egg serves: its platform subdomain plus any verified custom
 	// domains. The agent registers ingress routes for these and answers the ask
 	// endpoint for them.
@@ -223,8 +227,14 @@ type WorkloadSpec struct {
 	// keys travel over this contract. Secret values are injected out of band and
 	// are never included here, and are never logged.
 	Env []string `json:"env"`
-	// HealthCheckPath is the HTTP path polled for health checks.
+	// HealthCheckPath is the HTTP path polled for health checks (when HealthProbe
+	// is "http").
 	HealthCheckPath string `json:"healthCheckPath"`
+	// HealthProbe is how the agent decides a container is healthy: "http" (GET the
+	// health path), "tcp" (connect to the port) or "running" (healthy whenever it
+	// runs, for a database or game-server Egg that speaks a wire protocol). Empty
+	// keeps the agent's existing volume/port heuristic.
+	HealthProbe string `json:"healthProbe,omitempty"`
 	// ReleaseCommand is an optional command from the repo Procfile's release: line
 	// (e.g. "bin/rails db:migrate"). The agent runs it once as a one-shot container
 	// with this deployment's image, env and private networks BEFORE rolling the

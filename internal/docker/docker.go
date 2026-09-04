@@ -71,6 +71,9 @@ const (
 	LabelPort = LabelPrefix + ".port"
 	// LabelHealthPath carries the HTTP path the health probe requests.
 	LabelHealthPath = LabelPrefix + ".healthpath"
+	// LabelHealthProbe carries how the container is health-checked: "http", "tcp" or
+	// "running". Empty keeps the volume/port heuristic.
+	LabelHealthProbe = LabelPrefix + ".healthprobe"
 	// LabelReplica carries the 0-based replica index of this container within its
 	// workload, so a single Egg can run several load-balanced replicas, each in its
 	// own container with its own identity and (for web Eggs) its own host port.
@@ -451,8 +454,9 @@ func (e *engineClient) Create(ctx context.Context, spec contract.WorkloadSpec, v
 		LabelVersion:    version,
 		LabelReplica:    strconv.Itoa(replica),
 		// Recorded so the periodic health probe knows where and what to request.
-		LabelPort:       strconv.Itoa(spec.Port),
-		LabelHealthPath: spec.HealthCheckPath,
+		LabelPort:        strconv.Itoa(spec.Port),
+		LabelHealthPath:  spec.HealthCheckPath,
+		LabelHealthProbe: spec.HealthProbe,
 	}
 
 	// Env values are injected out of band: the agent fetched them from the secrets
@@ -530,11 +534,38 @@ func (e *engineClient) Create(ctx context.Context, spec contract.WorkloadSpec, v
 	// reachable on the host's public IP where it would bypass TLS and the ingress
 	// tier.
 	if spec.PublishPort > 0 && spec.Port > 0 {
-		if cp, perr := nat.NewPort("tcp", strconv.Itoa(spec.Port)); perr == nil {
-			config.ExposedPorts = nat.PortSet{cp: struct{}{}}
-			hostConfig.PortBindings = nat.PortMap{
-				cp: []nat.PortBinding{{HostIP: e.publishHost, HostPort: ""}},
+		exposed := nat.PortSet{}
+		bindings := nat.PortMap{}
+		if spec.PublishProtocol != "" {
+			// Game-server Egg: publish the game port on a KNOWN, PUBLIC host port that
+			// players dial directly (bind all interfaces, pin the port so the endpoint
+			// is stable). UDP for a native FishNet (Tugboat) server, TCP otherwise.
+			proto := "tcp"
+			if spec.PublishProtocol == "udp" {
+				proto = "udp"
 			}
+			if cp, perr := nat.NewPort(proto, strconv.Itoa(spec.Port)); perr == nil {
+				exposed[cp] = struct{}{}
+				bindings[cp] = []nat.PortBinding{{HostIP: "", HostPort: strconv.Itoa(spec.PublishPort)}}
+			}
+			// A game Egg that also serves a WebGL (WSS) route exposes the TCP port on
+			// loopback too, so the ingress (Caddy) can front it in addition to the
+			// public UDP port.
+			if proto == "udp" && len(spec.Hostnames) > 0 {
+				if tp, perr := nat.NewPort("tcp", strconv.Itoa(spec.Port)); perr == nil {
+					exposed[tp] = struct{}{}
+					bindings[tp] = []nat.PortBinding{{HostIP: e.publishHost, HostPort: ""}}
+				}
+			}
+		} else if cp, perr := nat.NewPort("tcp", strconv.Itoa(spec.Port)); perr == nil {
+			// Web/demo: loopback, ephemeral, fronted by the ingress tier (never bound
+			// to the host's public IP where it would bypass TLS and ingress).
+			exposed[cp] = struct{}{}
+			bindings[cp] = []nat.PortBinding{{HostIP: e.publishHost, HostPort: ""}}
+		}
+		if len(bindings) > 0 {
+			config.ExposedPorts = exposed
+			hostConfig.PortBindings = bindings
 		}
 	}
 
@@ -933,6 +964,18 @@ func (e *engineClient) probeHealth(ctx context.Context, info types.ContainerJSON
 	var labels map[string]string
 	if info.Config != nil {
 		labels = info.Config.Labels
+	}
+	// An explicit probe mode from the control plane wins. A game-server or database
+	// Egg speaks a wire protocol, not HTTP, so it is "running": healthy whenever the
+	// container runs (a crash exits it and this turns false, so a restart still fires).
+	switch labels[LabelHealthProbe] {
+	case "running":
+		return isHealthy(info)
+	case "tcp":
+		if ip, port := containerIP(info), labels[LabelPort]; ip != "" && port != "" && port != "0" {
+			return probeTCP(ctx, net.JoinHostPort(ip, port))
+		}
+		return isHealthy(info)
 	}
 	// A stateful database Egg speaks a database wire protocol, not HTTP. It is healthy
 	// whenever its container is running (if the engine dies the container exits and
