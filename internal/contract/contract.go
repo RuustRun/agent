@@ -264,6 +264,10 @@ type WorkloadSpec struct {
 	// external Postgres source (pg_dump piped into the Egg's own container). Nil when
 	// there is no active import. See ImportDirective.
 	Import *ImportDirective `json:"import,omitempty"`
+	// Backup, when set, is a backup capture or restore for this database Egg (pg_dump
+	// to a durable host file, or restore of one). Nil when there is no active backup.
+	// See BackupDirective.
+	Backup *BackupDirective `json:"backup,omitempty"`
 	// Limits are the hard resource limits enforced by the agent.
 	Limits ResourceLimits `json:"limits"`
 	// EnvValues is the decrypted env as "KEY=VALUE" lines, populated locally by the
@@ -321,6 +325,24 @@ type ImportDirective struct {
 	ImportID string `json:"importId"`
 	// Engine is the database engine ("postgres"), so the agent picks the right tool.
 	Engine string `json:"engine"`
+}
+
+// BackupDirective tells the agent to capture or restore a snapshot of a database
+// Egg. Capture runs pg_dump inside the Egg's container to a durable host file and
+// reports the ref/size/checksum back; restore loads a prior snapshot (Ref) back in.
+// The agent runs a given BackupID only once per process.
+type BackupDirective struct {
+	// BackupID is echoed back on the status report.
+	BackupID string `json:"backupId"`
+	// Action is "capture" or "restore".
+	Action string `json:"action"`
+	// Engine is the database engine ("postgres").
+	Engine string `json:"engine"`
+	// Ref, for a restore, is the host file (from a prior capture) to load back.
+	Ref string `json:"ref,omitempty"`
+	// Retention, for a capture, is how many newest snapshots to keep on the host
+	// (older ones are pruned after this capture).
+	Retention int `json:"retention,omitempty"`
 }
 
 // NetworkAttachment is one private-network peering: a two-party bridge shared with
@@ -482,6 +504,9 @@ type ContainerHealth struct {
 	// importing into, so the control plane can move the Import through
 	// importing -> done/failed and show progress. Nil when there is no active import.
 	Import *ImportReport `json:"import,omitempty"`
+	// Backup, when set, reports backup capture/restore progress for a database Egg.
+	// Nil when there is no active backup. See BackupReport.
+	Backup *BackupReport `json:"backup,omitempty"`
 }
 
 // BuildReport is host-side build progress for a workload the agent is building
@@ -504,6 +529,24 @@ type ImportReport struct {
 	// Status is the import phase: "importing", "done" or "failed".
 	Status string `json:"status"`
 	// Log is incremental, redacted import output since the last report (may be empty).
+	Log string `json:"log,omitempty"`
+}
+
+// BackupReport is capture/restore progress for a database Egg's backup, driving the
+// Backup's status. On a capture "done" it carries the durable file Ref, its size and
+// checksum so the control plane can record and later restore the snapshot.
+type BackupReport struct {
+	// BackupID is the backup this report is for (from the backup directive).
+	BackupID string `json:"backupId"`
+	// Status is the backup phase: "running", "done" or "failed".
+	Status string `json:"status"`
+	// Ref, on a capture "done", is the durable host file the snapshot was written to.
+	Ref string `json:"ref,omitempty"`
+	// SizeBytes is the snapshot size on a capture "done".
+	SizeBytes int64 `json:"sizeBytes,omitempty"`
+	// Checksum is the snapshot sha256 on a capture "done".
+	Checksum string `json:"checksum,omitempty"`
+	// Log is incremental, redacted output since the last report (may be empty).
 	Log string `json:"log,omitempty"`
 }
 

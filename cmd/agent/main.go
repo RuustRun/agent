@@ -52,6 +52,7 @@ import (
 	"github.com/RuustRun/agent/internal/build"
 	"github.com/RuustRun/agent/internal/cgroups"
 	"github.com/RuustRun/agent/internal/contract"
+	"github.com/RuustRun/agent/internal/dbbackup"
 	"github.com/RuustRun/agent/internal/dbimport"
 	"github.com/RuustRun/agent/internal/docker"
 	"github.com/RuustRun/agent/internal/hostcap"
@@ -139,6 +140,7 @@ func main() {
 		ingress:  ingress.New(cfg.caddyAdminURL, cfg.upstreamHost, cfg.askEndpoint, cfg.localTLS, log),
 		builder:  build.New(),
 		importer: dbimport.New(),
+		backuper: dbbackup.New(),
 	}
 
 	// Serve the on-demand TLS ask endpoint that Caddy calls before issuing a
@@ -185,6 +187,12 @@ type agent struct {
 	// is set each tick and consumed by reportStatus, keyed by workload id.
 	importer      *dbimport.Importer
 	importReports map[string]*contract.ImportReport
+
+	// backuper captures and restores snapshots of a database Egg (pg_dump to a
+	// durable host file, and restore back). backupReports is set each tick and
+	// consumed by reportStatus, keyed by workload id.
+	backuper      *dbbackup.Backuper
+	backupReports map[string]*contract.BackupReport
 
 	// appliedVersion is the last desired-state version the agent successfully
 	// converged to. It lets the agent no-op cheaply whilst the hash is unchanged.
@@ -503,6 +511,10 @@ func (a *agent) tick(ctx context.Context) {
 	// runs once per process and progress is reported on the status endpoint.
 	a.runImports(ctx, desired.Workloads)
 
+	// Backups, if any (capture or restore). Also AFTER converge, since both run
+	// against the running database container. Async and idempotent per backup id.
+	a.runBackups(ctx, desired.Workloads)
+
 	// Reconcile ingress: for every Egg that is published (a web Egg, PublishPort > 0)
 	// and has at least one hostname, register a Caddy route that load-balances across
 	// the host ports of its live replicas, and refresh the ask allow-list. Replicas
@@ -688,6 +700,38 @@ func (a *agent) runImports(ctx context.Context, workloads []contract.WorkloadSpe
 	}
 }
 
+// runBackups processes any pending backup capture/restore for database Eggs on this
+// host. For each workload carrying a backup directive, once its container is running,
+// it starts (or continues) the async job and records the progress report for
+// reportStatus to ship. The database must be up (both dump and restore run against
+// the running container), so a workload still starting is skipped this tick.
+func (a *agent) runBackups(ctx context.Context, workloads []contract.WorkloadSpec) {
+	a.backupReports = map[string]*contract.BackupReport{}
+
+	running := map[string]string{} // workloadID -> containerID
+	if actual, err := a.docker.List(ctx); err == nil {
+		for _, c := range actual {
+			if c.State == contract.StateRunning {
+				running[c.WorkloadID] = c.ID
+			}
+		}
+	}
+
+	for _, w := range workloads {
+		if w.Backup == nil {
+			continue
+		}
+		cID, ok := running[w.ID]
+		if !ok {
+			continue // container not up yet; retry next tick once it is running
+		}
+		_, report := a.backuper.Ensure(ctx, cID, w.BlobID, w.Backup)
+		if report != nil {
+			a.backupReports[w.ID] = report
+		}
+	}
+}
+
 // fetchSecrets performs GET /api/v1/hosts/:id/secrets and returns the decrypted
 // env per workload as "KEY=VALUE" lines, any short-lived git clone token for a
 // private host-built repo, and any external source connection string for an
@@ -825,6 +869,18 @@ func (a *agent) reportStatus(ctx context.Context, appliedVersion string) {
 			}
 		}
 		a.importReports = nil
+	}
+
+	// Backup reports (capture/restore), same as imports: they run against a RUNNING
+	// container, so the report rides on its existing health entry.
+	if len(a.backupReports) > 0 {
+		for i := range health {
+			if r, ok := a.backupReports[health[i].WorkloadID]; ok {
+				health[i].Backup = r
+				delete(a.backupReports, health[i].WorkloadID)
+			}
+		}
+		a.backupReports = nil
 	}
 
 	// Detect the host's real capacity every heartbeat, so a resized VPS is picked
