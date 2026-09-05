@@ -611,6 +611,11 @@ type HostStatus struct {
 	CpuCores float64 `json:"cpuCores,omitempty"`
 	// TotalRamMb is total host RAM in MB, agent-detected. Same omitempty rule.
 	TotalRamMb int `json:"totalRamMb,omitempty"`
+	// DiskTotalGb and DiskFreeGb are the total and available space of the host's
+	// tenant-data filesystem in GB, agent-detected each heartbeat. The control plane
+	// budgets placement against these. Same omitempty (0 = miss, keep known value).
+	DiskTotalGb int `json:"diskTotalGb,omitempty"`
+	DiskFreeGb  int `json:"diskFreeGb,omitempty"`
 	// OSName and OSVersion identify the host operating system (for example "Ubuntu"
 	// and "22.04"), for the operator fleet view. Omitted when not detected.
 	OSName    string `json:"osName,omitempty"`

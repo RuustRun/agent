@@ -889,6 +889,7 @@ func (a *agent) reportStatus(ctx context.Context, appliedVersion string) {
 	// up on the next tick. A detection miss returns 0 and is omitted from the JSON,
 	// so it never overwrites a known-good value on the control plane.
 	cpuCores, totalRamMb := hostcap.Detect()
+	diskTotalGb, diskFreeGb := hostcap.DetectDisk()
 
 	// OS and patch facts for the operator fleet view. Cheap facts are read each
 	// tick; the security-update check is cached inside hostfacts and refreshed only
@@ -901,6 +902,8 @@ func (a *agent) reportStatus(ctx context.Context, appliedVersion string) {
 		AppliedVersion:  appliedVersion,
 		CpuCores:        cpuCores,
 		TotalRamMb:      totalRamMb,
+		DiskTotalGb:     diskTotalGb,
+		DiskFreeGb:      diskFreeGb,
 		OSName:          facts.OSName,
 		OSVersion:       facts.OSVersion,
 		Kernel:          facts.Kernel,

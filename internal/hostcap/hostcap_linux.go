@@ -18,12 +18,26 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // Detect returns the host's CPU core count and total RAM in MB. Either may be 0
 // when it cannot be read; the caller omits a zero field from the report.
 func Detect() (cpuCores float64, totalRamMb int) {
 	return detectCores(), detectRamMb()
+}
+
+// DetectDisk returns the total and available space (GB) of the tenant-data
+// filesystem (see dataDir). Either is 0 on a statfs miss, which the caller omits so
+// it never overwrites a known value.
+func DetectDisk() (totalGb, freeGb int) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(dataDir(), &st); err != nil {
+		return 0, 0
+	}
+	bsize := uint64(st.Bsize)
+	const gb = 1 << 30
+	return int(uint64(st.Blocks) * bsize / gb), int(uint64(st.Bavail) * bsize / gb)
 }
 
 // detectCores counts the host's logical CPUs from /proc/cpuinfo. We read /proc
