@@ -28,9 +28,19 @@ import (
 	"github.com/RuustRun/agent/internal/contract"
 )
 
-// backupRoot is where snapshots are written on the host. The agent's systemd unit
-// grants it write access to /var/lib/ruust.
-const backupRoot = "/var/lib/ruust/backups"
+// defaultBackupRoot is where snapshots are written on a real host. The agent's
+// systemd unit grants it write access to /var/lib/ruust. Local dev (macOS, where
+// /var/lib is not writable) and test environments override it with RUUST_BACKUP_DIR,
+// mirroring the migration relay's RUUST_MIGRATION_DIR.
+const defaultBackupRoot = "/var/lib/ruust/backups"
+
+// backupRoot resolves the snapshot directory, honouring RUUST_BACKUP_DIR when set.
+func backupRoot() string {
+	if d := os.Getenv("RUUST_BACKUP_DIR"); d != "" {
+		return d
+	}
+	return defaultBackupRoot
+}
 
 // Relay moves snapshot bytes to and from the control-plane staging endpoints, so a
 // snapshot can be copied off its host onto a Vault (and fetched back for a restore).
@@ -148,7 +158,7 @@ func (b *Backuper) run(ctx context.Context, containerID, blobID string, d *contr
 // to a durable host file, recording its size and sha256, then prunes older snapshots
 // to the retention count.
 func (b *Backuper) capture(ctx context.Context, containerID, blobID string, d *contract.BackupDirective, appendLog func(string), fail func(string), j *job) {
-	dir := filepath.Join(backupRoot, blobID)
+	dir := filepath.Join(backupRoot(), blobID)
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		fail("could not create the backup directory: " + err.Error())
 		return
