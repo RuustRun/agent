@@ -353,7 +353,7 @@ type ImportDirective struct {
 type BackupDirective struct {
 	// BackupID is echoed back on the status report.
 	BackupID string `json:"backupId"`
-	// Action is "capture", "restore", "upload", "store" or "fetch".
+	// Action is "capture", "restore", "upload", "store", "fetch" or "delete".
 	Action string `json:"action"`
 	// Engine is the database engine ("postgres").
 	Engine string `json:"engine"`

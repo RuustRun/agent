@@ -149,9 +149,30 @@ func (b *Backuper) run(ctx context.Context, containerID, blobID string, d *contr
 		b.store(ctx, containerID, blobID, d, appendLog, fail, j)
 	case "fetch":
 		b.fetch(ctx, containerID, d, appendLog, fail, j)
+	case "delete":
+		b.remove(d, appendLog, fail, j)
 	default:
 		b.capture(ctx, containerID, blobID, d, appendLog, fail, j)
 	}
+}
+
+// remove deletes a snapshot file from the host (a customer deleting a snapshot). Ref
+// must be under the backup root, so a delete can never touch a file outside it.
+func (b *Backuper) remove(d *contract.BackupDirective, appendLog func(string), fail func(string), j *job) {
+	root := backupRoot()
+	clean := filepath.Clean(d.Ref)
+	if d.Ref == "" || !strings.HasPrefix(clean, filepath.Clean(root)+string(filepath.Separator)) {
+		fail("refusing to delete a file outside the backup directory")
+		return
+	}
+	if err := os.Remove(clean); err != nil && !os.IsNotExist(err) {
+		fail("could not delete the snapshot: " + err.Error())
+		return
+	}
+	appendLog("[backup] deleted the snapshot\n")
+	j.mu.Lock()
+	j.status = "done"
+	j.mu.Unlock()
 }
 
 // capture streams pg_dump of the Egg's own database (custom format, for pg_restore)
