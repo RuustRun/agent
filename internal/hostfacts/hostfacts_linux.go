@@ -29,9 +29,10 @@ var (
 func Detect() Facts {
 	name, version := osRelease()
 	f := Facts{
-		OSName:    name,
-		OSVersion: version,
-		Kernel:    kernelRelease(),
+		OSName:        name,
+		OSVersion:     version,
+		Kernel:        kernelRelease(),
+		UptimeSeconds: uptimeSeconds(),
 	}
 
 	mu.Lock()
@@ -104,4 +105,19 @@ func securityUpdates() *int {
 func rebootRequired() bool {
 	_, err := os.Stat("/var/run/reboot-required")
 	return err == nil
+}
+
+// uptimeSeconds reads seconds since boot from /proc/uptime (first field). 0 when it
+// cannot be read, so a miss reads as "not determined" rather than a fresh boot.
+func uptimeSeconds() int64 {
+	b, err := os.ReadFile("/proc/uptime")
+	if err != nil {
+		return 0
+	}
+	first, _, _ := strings.Cut(strings.TrimSpace(string(b)), " ")
+	secs, err := strconv.ParseFloat(first, 64)
+	if err != nil || secs < 0 {
+		return 0
+	}
+	return int64(secs)
 }

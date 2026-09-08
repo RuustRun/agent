@@ -19,4 +19,7 @@ type Facts struct {
 	// not be determined, so the control plane can tell "0, patched" from "unknown".
 	SecurityUpdates *int
 	RebootRequired  bool
+	// UptimeSeconds is how long the box has been up. Lets the control plane detect a
+	// reboot (uptime resets), so an admin reboot request self-clears. 0 = not determined.
+	UptimeSeconds int64
 }

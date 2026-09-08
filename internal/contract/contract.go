@@ -483,6 +483,16 @@ type DesiredState struct {
 	Version string `json:"version"`
 	// Workloads are the workloads that should be running on this host.
 	Workloads []WorkloadSpec `json:"workloads"`
+	// RebootRequestedAt is an admin-requested reboot, as an RFC3339 instant. The
+	// agent reboots when this is after the box's own boot time, and skips it once
+	// the box has booted since (so it is idempotent across polls). Empty = none.
+	// Deliberately outside the version hash: a reboot must not roll workloads.
+	RebootRequestedAt string `json:"rebootRequestedAt,omitempty"`
+	// CancelledDeploymentIDs are deployments whose in-flight build on this host
+	// should be stopped (cancelled by a customer/admin, or superseded by a newer
+	// deploy). The agent SIGTERMs the matching build if still running; unknown ids
+	// are ignored. Outside the version hash: cancelling never rolls workloads.
+	CancelledDeploymentIDs []string `json:"cancelledDeploymentIds,omitempty"`
 }
 
 // CgroupUsage is the measured cgroup v2 usage for one container. Egress is
@@ -630,6 +640,11 @@ type HostStatus struct {
 	// finish applying updates. Sent even when false (no omitempty), so the control
 	// plane can clear a stale flag after the box has been rebooted.
 	RebootRequired bool `json:"rebootRequired"`
+	// UptimeSeconds is how long the host has been up (from /proc/uptime). Lets the
+	// control plane tell when a box has rebooted (uptime resets), so an admin reboot
+	// request self-clears once the host reports a boot after the request. omitempty:
+	// a host that cannot determine it (0) omits it rather than claiming a fresh boot.
+	UptimeSeconds int64 `json:"uptimeSeconds,omitempty"`
 	// RolledBack lists agent versions this node fetched, failed to run, and rolled
 	// back from (quarantined). Always sent (even empty, no omitempty) so the control
 	// plane can clear the alert once the node's quarantine is cleared.

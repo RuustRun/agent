@@ -40,6 +40,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -219,6 +220,12 @@ type agent struct {
 	// diskUsage caches the last measured volume usage per container id, so du runs at
 	// most once per diskMeasureTTL per container rather than on every status report.
 	diskUsage map[string]diskSample
+
+	// rebootIssued is set once this process has issued a reboot for the current request,
+	// so we do not spam `systemctl reboot` on every tick whilst the box is shutting down.
+	// A fresh process after the reboot starts false, and the boot-time check then keeps
+	// it from rebooting again (the request predates the new boot). Single-goroutine loop.
+	rebootIssued bool
 }
 
 // diskSample is a cached volume-usage measurement (bytes) and when it was taken.
@@ -475,6 +482,14 @@ func (a *agent) tick(ctx context.Context) {
 		}
 	}
 
+	// Stop any build the control plane cancelled (a customer/admin cancel, or a newer
+	// deploy that superseded it). Best-effort and idempotent: an unknown or finished
+	// deployment is a no-op. Done before the build phase so a cancelled build is not
+	// re-launched and a running one is torn down promptly.
+	for _, id := range desired.CancelledDeploymentIDs {
+		a.builder.Cancel(id)
+	}
+
 	// Host-side build phase (bring your own host). For any workload whose image the
 	// control plane asked us to build locally, ensure it is built (async) before it
 	// can run. A workload still building, or whose build failed, is held out of the
@@ -558,6 +573,41 @@ func (a *agent) tick(ctx context.Context) {
 	}
 
 	a.reportStatus(ctx, a.appliedVersion)
+
+	// An admin-requested reboot is the last thing we act on, so this tick's status
+	// (carrying our current uptime) reaches the control plane first. maybeReboot only
+	// reboots when the request post-dates our boot, so it never loops after the box
+	// comes back up.
+	a.maybeReboot(desired)
+}
+
+// maybeReboot reboots the host when the control plane has requested one that post-dates
+// the current boot. Idempotent: once the box has rebooted, its boot time is after the
+// request, so this is a no-op and the control plane clears the flag on the next report.
+func (a *agent) maybeReboot(desired contract.DesiredState) {
+	if desired.RebootRequestedAt == "" || a.rebootIssued {
+		return
+	}
+	reqAt, err := time.Parse(time.RFC3339, desired.RebootRequestedAt)
+	if err != nil {
+		a.log.Warn("ignoring reboot request with unparseable timestamp", "value", desired.RebootRequestedAt)
+		return
+	}
+	// Boot time on our own clock. If the request predates it, the box has already
+	// rebooted since it was asked for, so there is nothing to do.
+	uptime := hostfacts.Detect().UptimeSeconds
+	bootedAt := time.Now().Add(-time.Duration(uptime) * time.Second)
+	if !reqAt.After(bootedAt) {
+		return
+	}
+	a.rebootIssued = true
+	a.log.Warn("reboot requested by control plane, rebooting host", "requestedAt", desired.RebootRequestedAt)
+	// systemctl on a systemd host; the agent runs as root under systemd. The process is
+	// terminated by the reboot, so we do not wait on the result.
+	if out, err := exec.Command("systemctl", "reboot").CombinedOutput(); err != nil {
+		a.log.Error("reboot command failed", "err", err, "out", strings.TrimSpace(string(out)))
+		a.rebootIssued = false // let a later tick retry
+	}
 }
 
 // fetchDesiredState performs GET /api/v1/hosts/:id/desired-state. It returns the
@@ -909,6 +959,7 @@ func (a *agent) reportStatus(ctx context.Context, appliedVersion string) {
 		Kernel:          facts.Kernel,
 		SecurityUpdates: facts.SecurityUpdates,
 		RebootRequired:  facts.RebootRequired,
+		UptimeSeconds:   facts.UptimeSeconds,
 		RolledBack:      quarantinedList(),
 		Containers:      health,
 		AgentLogs:       a.logs.snapshot(),
