@@ -1,10 +1,13 @@
 package build
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/RuustRun/agent/internal/contract"
 )
 
 // A repo with no Nixpacks config gets a nixpacks.toml pinning the archive, so the build
@@ -64,3 +67,57 @@ func TestEnsureNixpkgsPin_RespectsExistingJSON(t *testing.T) {
 		t.Errorf("should not write nixpacks.toml when nixpacks.json is present (err=%v)", err)
 	}
 }
+
+// New wires up a one-at-a-time build semaphore, so rapid redeploys queue rather than
+// thrash the host with several parallel builds.
+func TestNew_BuildConcurrencyCapIsOne(t *testing.T) {
+	b := New()
+	if cap(b.sem) != 1 {
+		t.Fatalf("expected a build concurrency cap of 1, got %d", cap(b.sem))
+	}
+	// The slot is free at rest: one acquire must succeed without blocking.
+	select {
+	case b.sem <- struct{}{}:
+		<-b.sem
+	default:
+		t.Fatal("build slot should be free on a fresh Builder")
+	}
+}
+
+// Cancel on a deployment with no in-flight build is a safe no-op (the control plane
+// sends recently-cancelled ids every poll, most of which are already finished).
+func TestCancel_UnknownDeploymentIsNoOp(t *testing.T) {
+	b := New()
+	b.Cancel("does-not-exist") // must not panic or block
+}
+
+// Cancel closes the build's context so the run goroutine tears down, and cancelling by
+// DeploymentID resolves through the tag mapping registered in Ensure.
+func TestCancel_StopsAnInFlightBuild(t *testing.T) {
+	b := New()
+	// Stand up a job as Ensure would, without launching a real (docker-dependent) build.
+	tag := "ruust-build/blob:abc1234"
+	depID := "dep-1"
+	ctx, cancel := context.WithCancel(context.Background())
+	b.mu.Lock()
+	b.jobs[tag] = &job{status: "building"}
+	b.cancels[tag] = cancel
+	b.tagByDeploy[depID] = tag
+	b.mu.Unlock()
+
+	b.Cancel(depID)
+
+	if ctx.Err() == nil {
+		t.Fatal("Cancel should have cancelled the build context")
+	}
+	b.mu.Lock()
+	canceled := b.jobs[tag].canceled
+	b.mu.Unlock()
+	if !canceled {
+		t.Fatal("Cancel should mark the job cancelled so its failure logs softly")
+	}
+}
+
+// Compile-time nod that a cancelled deployment id list from desired-state is a plain
+// []string the tick can iterate straight into Cancel.
+var _ = func(d contract.DesiredState) []string { return d.CancelledDeploymentIDs }

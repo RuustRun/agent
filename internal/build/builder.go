@@ -25,6 +25,8 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/RuustRun/agent/internal/contract"
 )
@@ -49,6 +51,16 @@ const pinnedNixpkgsArchive = "389ed85304b281ca7f306cf8a1eb4378651ca44e"
 type Builder struct {
 	mu   sync.Mutex
 	jobs map[string]*job
+	// cancels holds the cancel func for each in-flight build, keyed by ImageTag, so a
+	// running build can be stopped (its context is cancelled, which SIGTERMs the build
+	// process group). tagByDeploy maps a DeploymentID to its ImageTag, because the
+	// control plane cancels by deployment but jobs are keyed by tag.
+	cancels     map[string]context.CancelFunc
+	tagByDeploy map[string]string
+	// sem caps concurrent builds to one per host: a build acquires it before doing any
+	// work and releases it when done, so rapid redeploys queue instead of thrashing the
+	// box (several parallel nixpacks/docker builds can exhaust its CPU and disk).
+	sem chan struct{}
 	// Registry hosts this process has already logged in to (dedicated build host,
 	// pushing built images). Keyed by host so a re-login is skipped per build.
 	loggedIn map[string]bool
@@ -60,10 +72,19 @@ type job struct {
 	log      strings.Builder
 	sent     int  // bytes of log already handed back to the caller
 	reported bool // whether the terminal (built/failed) report has been returned once
+	canceled bool // set when the build was cancelled, to soften the failure log
 }
 
 // New returns an empty Builder.
-func New() *Builder { return &Builder{jobs: map[string]*job{}, loggedIn: map[string]bool{}} }
+func New() *Builder {
+	return &Builder{
+		jobs:        map[string]*job{},
+		cancels:     map[string]context.CancelFunc{},
+		tagByDeploy: map[string]string{},
+		sem:         make(chan struct{}, 1), // one build at a time per host
+		loggedIn:    map[string]bool{},
+	}
+}
 
 // Ensure makes sure the directive's ImageTag exists locally, building it in the
 // background when it does not. It returns whether the image is ready to run and,
@@ -86,8 +107,14 @@ func (b *Builder) Ensure(ctx context.Context, d *contract.BuildDirective, envVal
 	if !ok {
 		j = &job{status: "building"}
 		b.jobs[d.ImageTag] = j
-		// Detached context: the build must outlive the tick that started it.
-		go b.run(context.Background(), d, envValues, cloneToken, j)
+		// Detached, cancellable context: the build must outlive the tick that started
+		// it, but stay stoppable (Cancel closes buildCtx, which SIGTERMs the build).
+		buildCtx, cancel := context.WithCancel(context.Background())
+		b.cancels[d.ImageTag] = cancel
+		if d.DeploymentID != "" {
+			b.tagByDeploy[d.DeploymentID] = d.ImageTag
+		}
+		go b.run(buildCtx, d, envValues, cloneToken, j)
 	}
 	b.mu.Unlock()
 
@@ -106,12 +133,14 @@ func (b *Builder) Ensure(ctx context.Context, d *contract.BuildDirective, envVal
 	case "built":
 		if !j.reported {
 			j.reported = true
+			b.forget(d.ImageTag, d.DeploymentID)
 			return true, &contract.BuildReport{DeploymentID: d.DeploymentID, Status: "built", Log: delta}
 		}
 		return true, nil
 	case "failed":
 		if !j.reported {
 			j.reported = true
+			b.forget(d.ImageTag, d.DeploymentID)
 			return false, &contract.BuildReport{DeploymentID: d.DeploymentID, Status: "failed", Log: delta}
 		}
 		// Keep asserting failed (no new log) so the control plane stays failed until a
@@ -119,6 +148,44 @@ func (b *Builder) Ensure(ctx context.Context, d *contract.BuildDirective, envVal
 		return false, &contract.BuildReport{DeploymentID: d.DeploymentID, Status: "failed"}
 	default: // building
 		return false, &contract.BuildReport{DeploymentID: d.DeploymentID, Status: "building", Log: delta}
+	}
+}
+
+// forget drops the cancel handle and deployment mapping for a finished build, so the
+// maps do not grow without bound. The job itself is kept (a failed job keeps asserting
+// failed until a new tag supersedes it). Safe to call holding a job lock: it only takes
+// the builder lock, and Cancel never holds the builder lock whilst taking a job lock.
+func (b *Builder) forget(tag, deploymentID string) {
+	b.mu.Lock()
+	delete(b.cancels, tag)
+	if deploymentID != "" {
+		delete(b.tagByDeploy, deploymentID)
+	}
+	b.mu.Unlock()
+}
+
+// Cancel stops the in-flight build for a deployment, if one is running. It closes the
+// build's context (which SIGTERMs the build process group) and marks the job cancelled
+// so its failure is logged softly rather than as an error. A no-op for an unknown or
+// already-finished deployment. Non-blocking and safe to call every tick.
+func (b *Builder) Cancel(deploymentID string) {
+	b.mu.Lock()
+	tag := b.tagByDeploy[deploymentID]
+	cancel := b.cancels[tag]
+	j := b.jobs[tag]
+	b.mu.Unlock() // release before taking a job lock, so lock order never inverts.
+
+	if j != nil {
+		j.mu.Lock()
+		alreadyDone := j.status == "built" || j.status == "failed"
+		j.canceled = true
+		j.mu.Unlock()
+		if alreadyDone {
+			return
+		}
+	}
+	if cancel != nil {
+		cancel()
 	}
 }
 
@@ -136,10 +203,32 @@ func (b *Builder) run(ctx context.Context, d *contract.BuildDirective, envValues
 		j.mu.Unlock()
 	}
 	fail := func(msg string) {
-		appendLog("[error] " + msg + "\n")
 		j.mu.Lock()
+		canceled := j.canceled
 		j.status = "failed"
 		j.mu.Unlock()
+		// A cancelled build failing is expected (we stopped it), so log it softly
+		// rather than as an [error] that would read as a real build failure.
+		if canceled || ctx.Err() != nil {
+			appendLog("[cancel] build stopped\n")
+			return
+		}
+		appendLog("[error] " + msg + "\n")
+	}
+
+	// Cap concurrent builds to one per host: acquire the slot before doing any work,
+	// so rapid redeploys queue rather than thrash the box. If this build is cancelled
+	// whilst it waits in the queue, bail out here without ever starting.
+	select {
+	case b.sem <- struct{}{}:
+		defer func() { <-b.sem }()
+	case <-ctx.Done():
+		fail("build cancelled before it started")
+		return
+	}
+	if ctx.Err() != nil {
+		fail("build cancelled before it started")
+		return
 	}
 
 	dir, err := os.MkdirTemp("", "ruust-hostbuild-")
@@ -300,6 +389,17 @@ func runCmd(ctx context.Context, dir string, env []string, appendLog func(string
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
 	cmd.Env = env
+	// Put the build in its own process group and, when the context is cancelled (a
+	// build cancel), SIGTERM the whole group so nixpacks/docker and their children
+	// stop, not just the immediate child. WaitDelay then SIGKILLs anything that lingers.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+		}
+		return nil
+	}
+	cmd.WaitDelay = 10 * time.Second
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
