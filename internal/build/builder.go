@@ -36,6 +36,15 @@ import (
 // bundles a current nixpkgs. Keep in step with infra/provisioning build-host bootstrap.
 const nixpacksVersion = "1.39.0"
 
+// pinnedNixpkgsArchive is a nixpkgs commit that ships a current Node across the majors
+// we build (nodejs_20 = 20.20.2, nodejs_22 >= 22.12). Even 1.39.0's bundled snapshot
+// lags: it ships nodejs_22 = 22.11.0, one patch below Prisma's 22.12 floor, and its
+// Node 20 is below the 20.19 floor too, so no major it bundles clears Prisma. Pinning
+// the archive ourselves stops the build inheriting whatever the buildpack happens to
+// bundle, so a repo builds against a known-good Node without the customer writing any
+// config. Verify a bump with `nixhub.io` (nodejs_20 >= 20.19 and nodejs_22 >= 22.12).
+const pinnedNixpkgsArchive = "389ed85304b281ca7f306cf8a1eb4378651ca44e"
+
 // Builder tracks in-flight local builds, one per image tag.
 type Builder struct {
 	mu   sync.Mutex
@@ -183,6 +192,9 @@ func (b *Builder) run(ctx context.Context, d *contract.BuildDirective, envValues
 			fail("no Dockerfile found and nixpacks is unavailable: " + nerr.Error())
 			return
 		}
+		// Pin the nixpkgs archive so the build gets a current Node, not whatever
+		// (possibly too old) snapshot the buildpack happens to bundle.
+		ensureNixpkgsPin(buildDir, appendLog)
 		args := []string{"build", "."}
 		for _, kv := range envValues {
 			args = append(args, "--env", kv)
@@ -358,6 +370,31 @@ func writableHome() (home, dockerConfig string) {
 	dockerConfig = filepath.Join(home, ".docker")
 	_ = os.MkdirAll(dockerConfig, 0o755)
 	return home, dockerConfig
+}
+
+// ensureNixpkgsPin writes a minimal nixpacks.toml pinning the nixpkgs archive when the
+// repo does not already carry Nixpacks config, so the build resolves its Node (and other
+// setup packages) against a current nixpkgs rather than the buildpack's stale bundled
+// snapshot. The partial config merges over Nixpacks' auto-detected plan: it only pins the
+// archive and leaves stack detection, install, build and start phases to Nixpacks.
+//
+// A repo that ships its own nixpacks.toml or nixpacks.json owns that file and is left
+// untouched (the customer can pin the archive there themselves). Best effort: a write
+// failure is logged and the build proceeds on the bundled snapshot.
+func ensureNixpkgsPin(buildDir string, appendLog func(string)) {
+	for _, name := range []string{"nixpacks.toml", "nixpacks.json"} {
+		if _, err := os.Stat(filepath.Join(buildDir, name)); err == nil {
+			return // the repo owns its Nixpacks config; do not override it
+		}
+	}
+	toml := "# Written by ruust-agent: pin nixpkgs to a current Node.\n" +
+		"[phases.setup]\n" +
+		"nixpkgsArchive = '" + pinnedNixpkgsArchive + "'\n"
+	if err := os.WriteFile(filepath.Join(buildDir, "nixpacks.toml"), []byte(toml), 0o644); err != nil {
+		appendLog("[build] warning: could not pin nixpkgs archive: " + err.Error() + "\n")
+		return
+	}
+	appendLog("[build] pinning nixpkgs archive " + pinnedNixpkgsArchive[:12] + " for a current Node\n")
 }
 
 // ensureNixpacks returns a path to the nixpacks binary, installing the pinned
