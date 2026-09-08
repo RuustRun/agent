@@ -364,12 +364,17 @@ func writableHome() (home, dockerConfig string) {
 // release into a writable cache directory when it is not already on PATH. This lets
 // an already-enrolled BYO host build without re-running its bootstrap.
 func ensureNixpacks(ctx context.Context, appendLog func(string)) (string, error) {
-	if p, err := exec.LookPath("nixpacks"); err == nil {
+	// Only accept an existing nixpacks if it is the version we pin. A host bootstrapped
+	// on (or previously self-installed with) an older release keeps that binary on PATH
+	// or in the cache dir, and an existence-only check would let a stale Nixpacks keep
+	// shipping old package versions (a Node too old for modern Prisma, say) forever. A
+	// version mismatch falls through to re-install the pinned release into the cache.
+	if p, err := exec.LookPath("nixpacks"); err == nil && nixpacksVersionMatches(p) {
 		return p, nil
 	}
 	dir := nixpacksCacheDir()
 	bin := filepath.Join(dir, "nixpacks")
-	if fi, err := os.Stat(bin); err == nil && !fi.IsDir() {
+	if fi, err := os.Stat(bin); err == nil && !fi.IsDir() && nixpacksVersionMatches(bin) {
 		return bin, nil
 	}
 
@@ -394,6 +399,17 @@ func ensureNixpacks(ctx context.Context, appendLog func(string)) (string, error)
 		return "", err
 	}
 	return bin, nil
+}
+
+// nixpacksVersionMatches reports whether the nixpacks at bin is the pinned version.
+// `nixpacks --version` prints e.g. "nixpacks 1.39.0"; a non-match (or an error running
+// it) means re-install, so the buildpack's bundled package set stays current.
+func nixpacksVersionMatches(bin string) bool {
+	out, err := exec.Command(bin, "--version").Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), nixpacksVersion)
 }
 
 // nixpacksCacheDir picks the first writable directory to cache the nixpacks binary.
