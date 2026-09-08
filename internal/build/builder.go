@@ -222,6 +222,11 @@ func (b *Builder) run(ctx context.Context, d *contract.BuildDirective, envValues
 	select {
 	case b.sem <- struct{}{}:
 		defer func() { <-b.sem }()
+		// Reclaim disk once the build is done, whilst we still hold the (only) build
+		// slot so no build runs during the prune. Over many deploys the build cache and
+		// old Egg images fill a BYO host's disk, and a full docker filesystem wedges
+		// buildkit at "exporting layers". Runs first (LIFO) then releases the slot.
+		defer pruneBuildDisk(appendLog)
 	case <-ctx.Done():
 		fail("build cancelled before it started")
 		return
@@ -381,6 +386,41 @@ func registryCreds(pushTo string) (host, user, pass string) {
 // imageExists returns true when the tag is present in the local Docker image store.
 func imageExists(ctx context.Context, tag string) bool {
 	return exec.CommandContext(ctx, "docker", "image", "inspect", tag).Run() == nil
+}
+
+// buildCacheKeep bounds how much recent build cache to retain (fast rebuilds), whilst
+// stopping it from growing without limit. Overridable for small BYO disks.
+var buildCacheKeep = func() string {
+	if v := os.Getenv("RUUST_BUILD_CACHE_KEEP"); v != "" {
+		return v
+	}
+	return "8GB"
+}()
+
+// pruneBuildDisk reclaims Docker disk after a build, so a BYO host does not fill up over
+// many deploys and wedge buildkit at "exporting layers". Best effort on a fresh, short
+// context (so a cancelled build still tidies up), and safe: prune never touches an image
+// that currently backs a container, so the running Egg (and, during a zero-downtime roll,
+// the old replica still serving) is always kept. It removes dangling layers, unused
+// images older than a day (old Egg builds pile up tagged, one per redeploy), and build
+// cache beyond a recent budget. Silent: this is host hygiene, not build output.
+func pruneBuildDisk(appendLog func(string)) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	home, dockerCfg := writableHome()
+	env := append(os.Environ(), "HOME="+home, "DOCKER_CONFIG="+dockerCfg)
+	quiet := func(string) {}
+
+	_ = runCmd(ctx, "", env, quiet, "docker", "image", "prune", "-f")
+	// Unused images older than 24h: reclaims superseded Egg builds without touching the
+	// just-built image (far newer) or anything backing a live container.
+	_ = runCmd(ctx, "", env, quiet, "docker", "image", "prune", "-a", "-f", "--filter", "until=24h")
+	// Bound the build cache. --keep-storage is not on every Docker version, so fall back
+	// to a full cache prune if it is rejected.
+	if err := runCmd(ctx, "", env, quiet, "docker", "builder", "prune", "-f", "--keep-storage="+buildCacheKeep); err != nil {
+		_ = runCmd(ctx, "", env, quiet, "docker", "builder", "prune", "-f")
+	}
+	appendLog("[cleanup] reclaimed unused Docker images and build cache\n")
 }
 
 // runCmd runs a command in dir with env, streaming combined stdout+stderr line by
