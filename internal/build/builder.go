@@ -30,7 +30,11 @@ import (
 )
 
 // nixpacksVersion pins the buildpack version, matching the build-host bootstrap.
-const nixpacksVersion = "1.29.1"
+// Bumped 1.29.1 -> 1.39.0: 1.29.1 bundled a June-2024 nixpkgs whose Node patches
+// were below modern tool floors (its nodejs_22 is 22.3.0; Prisma needs 20.19+/22.12+),
+// so a standard Prisma/Next app failed to build even with the right Node major. 1.39.0
+// bundles a current nixpkgs. Keep in step with infra/provisioning build-host bootstrap.
+const nixpacksVersion = "1.39.0"
 
 // Builder tracks in-flight local builds, one per image tag.
 type Builder struct {
