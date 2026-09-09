@@ -562,3 +562,64 @@ func TestConvergeRollIsZeroDowntime(t *testing.T) {
 		}
 	}
 }
+
+// TestDiff_BoundsOldContainersDuringStalledRoll proves the safety net against
+// container sprawl: when a roll stalls (no up-to-date container is healthy yet) and
+// several stale containers have piled up from earlier failed rolls, Diff keeps only ONE
+// old container serving and stops the rest, then starts the fresh one. Without this a
+// slot accumulates a stack of stale containers that starve the host.
+func TestDiff_BoundsOldContainersDuringStalledRoll(t *testing.T) {
+	w := spec("a", 1, "nginx:latest")
+	desired := contract.DesiredState{HostID: "h1", Version: "v-new", Workloads: []contract.WorkloadSpec{w}}
+
+	// Three stale containers from earlier deploys, no up-to-date one yet.
+	old1 := runningVersion("a", "nginx:latest", "v1", 0)
+	old2 := runningVersion("a", "nginx:latest", "v2", 0)
+	old3 := runningVersion("a", "nginx:latest", "v3", 0)
+
+	plan := Diff(desired, []docker.Container{old1, old2, old3})
+
+	// Two of the three stale containers must be stopped (keep one serving)...
+	if got := countActions(plan, ActionStop); got != 2 {
+		t.Errorf("expected 2 stale containers stopped (keep 1), got %d (plan: %+v)", got, plan.Steps)
+	}
+	// ...and a fresh container started for the slot.
+	if got := countActions(plan, ActionStart); got != 1 {
+		t.Errorf("expected 1 fresh start, got %d (plan: %+v)", got, plan.Steps)
+	}
+	// Exactly one old container survives (the one not stopped).
+	stopped := map[string]bool{}
+	for _, s := range plan.Steps {
+		if s.Action == ActionStop {
+			stopped[s.ContainerID] = true
+		}
+	}
+	if len(stopped) != 2 {
+		t.Fatalf("expected 2 distinct containers stopped, got %d", len(stopped))
+	}
+	survivors := 0
+	for _, c := range []docker.Container{old1, old2, old3} {
+		if !stopped[c.ID] {
+			survivors++
+		}
+	}
+	if survivors != 1 {
+		t.Errorf("exactly one old container should survive, got %d", survivors)
+	}
+}
+
+// A single old container during a normal roll is left untouched (still serving) whilst
+// the new one starts: the safety net must not disturb a healthy zero-downtime roll.
+func TestDiff_KeepsSingleOldContainerDuringRoll(t *testing.T) {
+	w := spec("a", 1, "nginx:latest")
+	desired := contract.DesiredState{HostID: "h1", Version: "v-new", Workloads: []contract.WorkloadSpec{w}}
+	old := runningVersion("a", "nginx:latest", "v-old", 0)
+
+	plan := Diff(desired, []docker.Container{old})
+	if got := countActions(plan, ActionStop); got != 0 {
+		t.Errorf("a single old container must not be stopped during a roll, got %d stops (plan: %+v)", got, plan.Steps)
+	}
+	if got := countActions(plan, ActionStart); got != 1 {
+		t.Errorf("expected the new container to start, got %d (plan: %+v)", got, plan.Steps)
+	}
+}
