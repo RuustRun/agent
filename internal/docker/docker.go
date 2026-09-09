@@ -392,12 +392,20 @@ func (e *engineClient) ensurePrivateNetwork(ctx context.Context, name string) er
 func (e *engineClient) Create(ctx context.Context, spec contract.WorkloadSpec, version string, replica int) (Container, error) {
 	name := containerName(spec.ID, replica, version)
 
-	// Idempotency: if a container with this name already exists for the same
-	// spec version, do nothing. If it exists for an older version, the caller
-	// (reconcile) will have stopped it first, so a leftover here means a partial
-	// previous run; remove it and recreate.
+	// Idempotency: a container with this name is a no-op ONLY when it already runs
+	// the desired version AND the desired image. The image check matters: a BYO
+	// rebuild keeps the OLD image serving under the NEW version's name whilst it
+	// builds (so there is no downtime), so once the new image is built this same
+	// name is still present but running the wrong image. Without the image check
+	// Create would see the matching version, return the old-image container, and the
+	// new image would never deploy: converge would re-issue ActionStart every tick
+	// forever (the deploy hangs on "building"). So if the version matches but the
+	// image does not, fall through and replace it. A different version is likewise
+	// replaced (a leftover from a partial previous run the caller did not stop).
 	if existing, err := e.cli.ContainerInspect(ctx, name); err == nil {
-		if existing.Config != nil && existing.Config.Labels[LabelVersion] == version {
+		if existing.Config != nil &&
+			existing.Config.Labels[LabelVersion] == version &&
+			existing.Config.Labels[LabelImageRef] == spec.ImageRef {
 			return e.toContainer(ctx, existing.ID), nil
 		}
 		_ = e.Stop(ctx, existing.ID)
