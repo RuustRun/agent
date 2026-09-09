@@ -149,8 +149,32 @@ func Diff(desired contract.DesiredState, actual []docker.Container) Plan {
 					}
 					continue
 				}
+				// SAFETY NET against container sprawl: never let more than one old
+				// container serve a slot. The zero-downtime roll only drains the old ones
+				// once a NEW container is healthy (the healthy(keeper) branch below); if
+				// that never happens (a build/container starved for memory, a failing
+				// health check) the old container is kept, and every further deploy adds
+				// another with no upper bound. Left unchecked a slot accumulates a stack of
+				// stale containers that hog the host's RAM (which then makes the next roll
+				// fail too). So keep just one old container serving, preferring a healthy
+				// one so the slot keeps a backend, and stop the rest.
+				if len(old) > 1 {
+					keepOld := old[0]
+					for _, c := range old {
+						if healthy(c) {
+							keepOld = c
+							break
+						}
+					}
+					for _, c := range old {
+						if c.ID != keepOld.ID {
+							plan.Steps = append(plan.Steps, step(ActionStop, c))
+						}
+					}
+				}
 				// Slot empty (or stateless): start the fresh container. For a stateless
-				// workload any old container is left serving until the new one is healthy.
+				// workload the one remaining old container is left serving until the new
+				// one is healthy, then drained by the healthy(keeper) branch below.
 				plan.Steps = append(plan.Steps, Step{Action: ActionStart, WorkloadID: w.ID, BlobID: w.BlobID, ReplicaIndex: idx})
 				continue
 			}
