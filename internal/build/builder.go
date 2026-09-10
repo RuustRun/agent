@@ -111,15 +111,19 @@ func New() *Builder {
 // cloneToken is a short-lived git token for a private repo (empty for public).
 // Both are redacted from the returned log.
 func (b *Builder) Ensure(ctx context.Context, d *contract.BuildDirective, envValues []string, cloneToken string) (ready bool, report *contract.BuildReport) {
-	// Fast path: the image already exists (built this run, a previous run, or a
-	// prior tick). Nothing to build and nothing to report.
-	if imageExists(ctx, d.ImageTag) {
-		return true, nil
-	}
-
 	b.mu.Lock()
 	j, ok := b.jobs[d.ImageTag]
 	if !ok {
+		// No in-flight build for this tag. If the image already exists (a previous run,
+		// or a prior process before a restart) there is nothing to build or report.
+		// This check MUST be inside the no-job branch: up front it would swallow a
+		// just-finished build's terminal report, because the build creates the image
+		// partway through "exporting layers", so the next tick would short-circuit here
+		// before ever reporting 'built' and the deploy would hang on "building".
+		if imageExists(ctx, d.ImageTag) {
+			b.mu.Unlock()
+			return true, nil
+		}
 		j = &job{status: "building"}
 		b.jobs[d.ImageTag] = j
 		// Detached, cancellable, time-bounded context: the build must outlive the tick
@@ -151,18 +155,21 @@ func (b *Builder) Ensure(ctx context.Context, d *contract.BuildDirective, envVal
 		if !j.reported {
 			j.reported = true
 			b.forget(d.ImageTag, d.DeploymentID)
-			return true, &contract.BuildReport{DeploymentID: d.DeploymentID, Status: "built", Log: delta}
 		}
-		return true, nil
+		// Re-assert 'built' on EVERY tick, not just once. A single terminal report can
+		// be lost (a failed status POST), and because the image now exists nothing
+		// would retry it, hanging the deploy on "building". Re-reporting is idempotent
+		// on the control plane (it flips the deployment live once, then no-ops); the log
+		// delta is only non-empty on the first report.
+		return true, &contract.BuildReport{DeploymentID: d.DeploymentID, Status: "built", Log: delta}
 	case "failed":
 		if !j.reported {
 			j.reported = true
 			b.forget(d.ImageTag, d.DeploymentID)
-			return false, &contract.BuildReport{DeploymentID: d.DeploymentID, Status: "failed", Log: delta}
 		}
-		// Keep asserting failed (no new log) so the control plane stays failed until a
-		// redeploy mints a new tag and a fresh job.
-		return false, &contract.BuildReport{DeploymentID: d.DeploymentID, Status: "failed"}
+		// Keep asserting failed each tick so the control plane converges to failed even
+		// if a report is lost, until a redeploy mints a new tag and a fresh job.
+		return false, &contract.BuildReport{DeploymentID: d.DeploymentID, Status: "failed", Log: delta}
 	default: // building
 		return false, &contract.BuildReport{DeploymentID: d.DeploymentID, Status: "building", Log: delta}
 	}

@@ -121,3 +121,36 @@ func TestCancel_StopsAnInFlightBuild(t *testing.T) {
 // Compile-time nod that a cancelled deployment id list from desired-state is a plain
 // []string the tick can iterate straight into Cancel.
 var _ = func(d contract.DesiredState) []string { return d.CancelledDeploymentIDs }
+
+// TestEnsure_ReportsBuiltEvenWhenImageExists proves the fix for the "stuck on
+// building / exporting layers" hang: a build that has completed (image now exists)
+// must still report its terminal 'built' status, and re-assert it each tick so a lost
+// report cannot leave the deploy hung. The old imageExists fast-path swallowed it.
+func TestEnsure_ReportsBuiltEvenWhenImageExists(t *testing.T) {
+	b := New()
+	tag := "ruust-egg/blob:abc1234"
+	d := &contract.BuildDirective{DeploymentID: "dep-1", ImageTag: tag}
+
+	// Simulate a finished build: a job already at 'built' for this tag. Because a job
+	// exists, Ensure takes the job path and never consults imageExists (no docker).
+	b.mu.Lock()
+	b.jobs[tag] = &job{status: "built"}
+	b.mu.Unlock()
+
+	ready, report := b.Ensure(context.Background(), d, nil, "")
+	if !ready {
+		t.Fatal("a built image should be ready to run")
+	}
+	if report == nil || report.Status != "built" {
+		t.Fatalf("expected a 'built' report, got %+v", report)
+	}
+	if report.DeploymentID != "dep-1" {
+		t.Errorf("wrong deployment id in report: %q", report.DeploymentID)
+	}
+
+	// Next tick: it must RE-assert 'built' (robust against a lost report), not go silent.
+	_, report2 := b.Ensure(context.Background(), d, nil, "")
+	if report2 == nil || report2.Status != "built" {
+		t.Fatalf("expected 'built' to be re-asserted on the next tick, got %+v", report2)
+	}
+}
