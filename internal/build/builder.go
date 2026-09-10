@@ -47,6 +47,21 @@ const nixpacksVersion = "1.39.0"
 // config. Verify a bump with `nixhub.io` (nodejs_20 >= 20.19 and nodejs_22 >= 22.12).
 const pinnedNixpkgsArchive = "389ed85304b281ca7f306cf8a1eb4378651ca44e"
 
+// buildTimeout caps how long a single build may run before it is stopped, so a wedged
+// build (a hung "exporting layers", a runaway install) can never tie up the host's
+// build slot and resources indefinitely. Generous by default so a legitimate slow
+// build (a cold nix cache on a small box) is never killed; override with
+// RUUST_BUILD_TIMEOUT (a Go duration like "45m"). When it fires, the build context is
+// cancelled, which SIGTERMs the build process group like a manual cancel.
+var buildTimeout = func() time.Duration {
+	if v := os.Getenv("RUUST_BUILD_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 30 * time.Minute
+}()
+
 // Builder tracks in-flight local builds, one per image tag.
 type Builder struct {
 	mu   sync.Mutex
@@ -107,9 +122,11 @@ func (b *Builder) Ensure(ctx context.Context, d *contract.BuildDirective, envVal
 	if !ok {
 		j = &job{status: "building"}
 		b.jobs[d.ImageTag] = j
-		// Detached, cancellable context: the build must outlive the tick that started
-		// it, but stay stoppable (Cancel closes buildCtx, which SIGTERMs the build).
-		buildCtx, cancel := context.WithCancel(context.Background())
+		// Detached, cancellable, time-bounded context: the build must outlive the tick
+		// that started it, but stay stoppable (Cancel closes buildCtx, which SIGTERMs
+		// the build) and self-stop if it runs past buildTimeout so a wedged build cannot
+		// hog the host forever.
+		buildCtx, cancel := context.WithTimeout(context.Background(), buildTimeout)
 		b.cancels[d.ImageTag] = cancel
 		if d.DeploymentID != "" {
 			b.tagByDeploy[d.DeploymentID] = d.ImageTag
@@ -207,13 +224,18 @@ func (b *Builder) run(ctx context.Context, d *contract.BuildDirective, envValues
 		canceled := j.canceled
 		j.status = "failed"
 		j.mu.Unlock()
-		// A cancelled build failing is expected (we stopped it), so log it softly
-		// rather than as an [error] that would read as a real build failure.
-		if canceled || ctx.Err() != nil {
+		switch {
+		case ctx.Err() == context.DeadlineExceeded:
+			// The build ran past its ceiling and was stopped: a real failure (a hung
+			// step), reported as such so the deploy fails rather than hanging.
+			appendLog(fmt.Sprintf("[error] build exceeded the %s timeout and was stopped\n", buildTimeout))
+		case canceled || ctx.Err() != nil:
+			// A cancelled build failing is expected (we stopped it), so log it softly
+			// rather than as an [error] that would read as a real build failure.
 			appendLog("[cancel] build stopped\n")
-			return
+		default:
+			appendLog("[error] " + msg + "\n")
 		}
-		appendLog("[error] " + msg + "\n")
 	}
 
 	// Cap concurrent builds to one per host: acquire the slot before doing any work,
