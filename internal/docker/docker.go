@@ -30,6 +30,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types"
@@ -177,6 +178,9 @@ type Client interface {
 	// `since` is empty a short tail is returned, so a first report is not a flood.
 	// Read via the Docker Engine API so it works on Linux and Docker Desktop alike.
 	Logs(ctx context.Context, id string, since string) ([]contract.LogLine, error)
+	// TakeReleaseReports returns and clears the release-command outcomes captured since
+	// the last call, keyed by workload ID, for the agent to attach to its status report.
+	TakeReleaseReports() map[string]*contract.ReleaseReport
 	// Close releases any underlying SDK resources.
 	Close() error
 }
@@ -196,6 +200,12 @@ type engineClient struct {
 	// the host and DEFEATS the enable_icc isolation. Only widen this for local
 	// development, and never to 0.0.0.0 on a host serving untrusted tenants.
 	publishHost string
+
+	// Release outcomes captured during Create (the release command runs synchronously
+	// there), keyed by workload ID, awaiting the next status report. Guarded because
+	// reconcile writes them and the status loop drains them on different goroutines.
+	releaseMu      sync.Mutex
+	releaseReports map[string]*contract.ReleaseReport
 }
 
 // NewEngineClient connects to the local Docker daemon using the environment
@@ -210,7 +220,11 @@ func NewEngineClient() (Client, error) {
 	if publishHost == "" {
 		publishHost = "127.0.0.1"
 	}
-	return &engineClient{cli: cli, publishHost: publishHost}, nil
+	return &engineClient{
+		cli:            cli,
+		publishHost:    publishHost,
+		releaseReports: map[string]*contract.ReleaseReport{},
+	}, nil
 }
 
 // containerName builds a stable, idempotent container name from the workload
@@ -682,20 +696,96 @@ func (e *engineClient) runRelease(ctx context.Context, spec contract.WorkloadSpe
 	}
 
 	statusCh, errCh := e.cli.ContainerWait(ctx, created.ID, container.WaitConditionNotRunning)
+	var runErr error
 	select {
 	case werr := <-errCh:
 		if werr != nil {
-			return fmt.Errorf("waiting for release container: %w", werr)
+			runErr = fmt.Errorf("waiting for release container: %w", werr)
 		}
-		return nil
 	case st := <-statusCh:
 		if st.StatusCode != 0 {
-			return fmt.Errorf("release command exited with code %d", st.StatusCode)
+			runErr = fmt.Errorf("release command exited with code %d", st.StatusCode)
 		}
-		return nil
 	case <-ctx.Done():
-		return ctx.Err()
+		runErr = ctx.Err()
 	}
+
+	// Capture the release output (redacted) for the deploy's Release log, on success and
+	// failure alike, whilst the container still exists (it is removed on the defer above).
+	// Best effort: a log-read failure never changes the outcome, which the exit code decides.
+	e.stashReleaseReport(spec, created.ID, runErr)
+	return runErr
+}
+
+// stashReleaseReport records a workload's release outcome and captured output for the next
+// status report. Called after the release container has exited. runErr nil means success.
+func (e *engineClient) stashReleaseReport(spec contract.WorkloadSpec, containerID string, runErr error) {
+	logCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	log := redactReleaseSecrets(e.readReleaseLog(logCtx, containerID), spec.EnvValues)
+	status := "succeeded"
+	if runErr != nil {
+		status = "failed"
+		// Append the failure so the tail of the log explains the non-zero exit.
+		if log != "" && !strings.HasSuffix(log, "\n") {
+			log += "\n"
+		}
+		log += "[error] " + runErr.Error() + "\n"
+	}
+	e.releaseMu.Lock()
+	if e.releaseReports == nil {
+		e.releaseReports = map[string]*contract.ReleaseReport{}
+	}
+	e.releaseReports[spec.ID] = &contract.ReleaseReport{Status: status, Log: log}
+	e.releaseMu.Unlock()
+}
+
+// readReleaseLog returns the release container's full combined output (stdout then stderr)
+// as plain text. Best effort: any read error yields an empty string.
+func (e *engineClient) readReleaseLog(ctx context.Context, id string) string {
+	rc, err := e.cli.ContainerLogs(ctx, id, container.LogsOptions{ShowStdout: true, ShowStderr: true})
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = rc.Close() }()
+	var out, errb bytes.Buffer
+	if _, err := stdcopy.StdCopy(&out, &errb, rc); err != nil {
+		return ""
+	}
+	combined := out.String()
+	if errb.Len() > 0 {
+		if combined != "" && !strings.HasSuffix(combined, "\n") {
+			combined += "\n"
+		}
+		combined += errb.String()
+	}
+	return combined
+}
+
+// redactReleaseSecrets strips env values (of a meaningful length) from release output, so
+// nothing secret reaches the control plane or the Release log. Mirrors the build redactor.
+func redactReleaseSecrets(s string, envValues []string) string {
+	for _, kv := range envValues {
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			if v := kv[i+1:]; len(v) >= 5 {
+				s = strings.ReplaceAll(s, v, "[redacted]")
+			}
+		}
+	}
+	return s
+}
+
+// TakeReleaseReports returns and clears the release outcomes captured since the last call,
+// keyed by workload ID, for the agent to attach to its status report.
+func (e *engineClient) TakeReleaseReports() map[string]*contract.ReleaseReport {
+	e.releaseMu.Lock()
+	defer e.releaseMu.Unlock()
+	if len(e.releaseReports) == 0 {
+		return nil
+	}
+	out := e.releaseReports
+	e.releaseReports = map[string]*contract.ReleaseReport{}
+	return out
 }
 
 func (e *engineClient) Stop(ctx context.Context, id string) error {

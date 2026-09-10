@@ -100,6 +100,8 @@ func (f *fakeClient) Logs(_ context.Context, _ string, _ string) ([]contract.Log
 	return nil, nil
 }
 
+func (f *fakeClient) TakeReleaseReports() map[string]*contract.ReleaseReport { return nil }
+
 func (f *fakeClient) Close() error { return nil }
 
 // spec is a small helper to build a WorkloadSpec with sane hard limits.
