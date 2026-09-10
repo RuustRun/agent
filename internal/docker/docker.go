@@ -653,11 +653,16 @@ func (e *engineClient) runRelease(ctx context.Context, spec contract.WorkloadSpe
 	config := &container.Config{
 		Image: spec.ImageRef,
 		Env:   env,
-		Cmd:   []string{"sh", "-c", spec.ReleaseCommand},
+		// Override the image's ENTRYPOINT, not just its CMD. A build image (Nixpacks)
+		// sets its own ENTRYPOINT (a launcher/start wrapper); if we set only Cmd, Docker
+		// passes our "sh -c <releaseCommand>" as ARGUMENTS to that entrypoint, which
+		// ignores them and exits 0. The release command then never runs (the migration
+		// silently does nothing and there is no output). Setting Entrypoint to sh -c runs
+		// the command directly, exactly like `docker run --entrypoint sh ... -c '<cmd>'`.
+		Entrypoint: []string{"sh", "-c"},
+		Cmd:        []string{spec.ReleaseCommand},
 		// AttachStdout/AttachStderr must be set for ContainerAttach to receive the
-		// container's output; `docker run` sets them and we did not, which is why the
-		// attached stream came back empty. Belt and braces alongside the ContainerLogs
-		// fallback below.
+		// container's output; `docker run` sets them and we did not.
 		AttachStdout: true,
 		AttachStderr: true,
 		Labels:       map[string]string{LabelPrefix + ".release": spec.ID},
