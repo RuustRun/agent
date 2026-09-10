@@ -240,6 +240,11 @@ type WorkloadSpec struct {
 	// with this deployment's image, env and private networks BEFORE rolling the
 	// workload, and gates the roll on its success. Empty means no release step.
 	ReleaseCommand string `json:"releaseCommand,omitempty"`
+	// DeploymentID is the current deployment's id. The agent echoes it in a
+	// ReleaseReport so the control plane attaches the release outcome to the exact
+	// deployment that ran it (a redeploy points the workload at a new deployment).
+	// Reporting only; the agent does not otherwise interpret it.
+	DeploymentID string `json:"deploymentId,omitempty"`
 	// Revision is an opaque deployment revision. It changes on redeploy, which
 	// changes the desired-state version and rolls the container even when the
 	// image is unchanged. The agent does not interpret it.
@@ -607,6 +612,10 @@ type ReleaseReport struct {
 	Status string `json:"status"`
 	// Log is the release container's full combined output (stdout+stderr), redacted.
 	Log string `json:"log,omitempty"`
+	// DeploymentID is the deployment the release ran for, so the control plane
+	// attaches the outcome to the exact deployment rather than the workload's
+	// current pointer (which can have rolled on to a newer, still-building deploy).
+	DeploymentID string `json:"deploymentId,omitempty"`
 }
 
 // LogLine is one line of container output, shipped incrementally by the agent.

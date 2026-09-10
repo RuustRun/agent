@@ -695,6 +695,21 @@ func (e *engineClient) runRelease(ctx context.Context, spec contract.WorkloadSpe
 		return fmt.Errorf("starting release container: %w", err)
 	}
 
+	// Follow the combined output to EOF (the stream ends when the container stops), so we
+	// capture the full release log from the start regardless of the host log driver or any
+	// post-exit flush race. Reading logs only AFTER ContainerWait returned could come back
+	// empty (the driver may not have flushed yet), which is why a real "No pending migrations"
+	// release showed as "succeeded, no output". ContainerLogs without Since replays from the
+	// beginning before following, so attaching just after start loses nothing. This follow
+	// read also serves as our wait; ContainerWait below then just yields the exit code.
+	var out, errb bytes.Buffer
+	if logs, logErr := e.cli.ContainerLogs(ctx, created.ID, container.LogsOptions{
+		ShowStdout: true, ShowStderr: true, Follow: true,
+	}); logErr == nil {
+		_, _ = stdcopy.StdCopy(&out, &errb, logs)
+		_ = logs.Close()
+	}
+
 	statusCh, errCh := e.cli.ContainerWait(ctx, created.ID, container.WaitConditionNotRunning)
 	var runErr error
 	select {
@@ -710,19 +725,30 @@ func (e *engineClient) runRelease(ctx context.Context, spec contract.WorkloadSpe
 		runErr = ctx.Err()
 	}
 
-	// Capture the release output (redacted) for the deploy's Release log, on success and
-	// failure alike, whilst the container still exists (it is removed on the defer above).
-	// Best effort: a log-read failure never changes the outcome, which the exit code decides.
-	e.stashReleaseReport(spec, created.ID, runErr)
+	// Record the outcome and captured output for the deploy's Release log, on success and
+	// failure alike. A log-read failure never changes the outcome, which the exit code decides.
+	e.stashReleaseReport(spec, combineStreams(out.String(), errb.String()), runErr)
 	return runErr
 }
 
+// combineStreams joins captured stdout and stderr into one log, stdout first, with a
+// newline between them so the two streams do not run together on one line.
+func combineStreams(out, errb string) string {
+	if errb == "" {
+		return out
+	}
+	if out != "" && !strings.HasSuffix(out, "\n") {
+		out += "\n"
+	}
+	return out + errb
+}
+
 // stashReleaseReport records a workload's release outcome and captured output for the next
-// status report. Called after the release container has exited. runErr nil means success.
-func (e *engineClient) stashReleaseReport(spec contract.WorkloadSpec, containerID string, runErr error) {
-	logCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	log := redactReleaseSecrets(e.readReleaseLog(logCtx, containerID), spec.EnvValues)
+// status report. rawLog is the release container's combined output (already read); runErr
+// nil means success. The report carries the deployment id so the control plane attaches it
+// to the exact deployment that ran, not the workload's current (possibly rolled) pointer.
+func (e *engineClient) stashReleaseReport(spec contract.WorkloadSpec, rawLog string, runErr error) {
+	log := redactReleaseSecrets(rawLog, spec.EnvValues)
 	status := "succeeded"
 	if runErr != nil {
 		status = "failed"
@@ -736,30 +762,8 @@ func (e *engineClient) stashReleaseReport(spec contract.WorkloadSpec, containerI
 	if e.releaseReports == nil {
 		e.releaseReports = map[string]*contract.ReleaseReport{}
 	}
-	e.releaseReports[spec.ID] = &contract.ReleaseReport{Status: status, Log: log}
+	e.releaseReports[spec.ID] = &contract.ReleaseReport{Status: status, Log: log, DeploymentID: spec.DeploymentID}
 	e.releaseMu.Unlock()
-}
-
-// readReleaseLog returns the release container's full combined output (stdout then stderr)
-// as plain text. Best effort: any read error yields an empty string.
-func (e *engineClient) readReleaseLog(ctx context.Context, id string) string {
-	rc, err := e.cli.ContainerLogs(ctx, id, container.LogsOptions{ShowStdout: true, ShowStderr: true})
-	if err != nil {
-		return ""
-	}
-	defer func() { _ = rc.Close() }()
-	var out, errb bytes.Buffer
-	if _, err := stdcopy.StdCopy(&out, &errb, rc); err != nil {
-		return ""
-	}
-	combined := out.String()
-	if errb.Len() > 0 {
-		if combined != "" && !strings.HasSuffix(combined, "\n") {
-			combined += "\n"
-		}
-		combined += errb.String()
-	}
-	return combined
 }
 
 // redactReleaseSecrets strips env values (of a meaningful length) from release output, so
