@@ -913,9 +913,9 @@ func (a *agent) reportStatus(ctx context.Context, appliedVersion string) {
 	// Release-command reports (e.g. migrations). The release runs synchronously during
 	// Create, so a successful one rides on the now-running container's health entry; a
 	// failed release leaves no new container, so its report attaches to an old container
-	// still serving (a redeploy) or, failing that, a synthesised crashed entry. Keyed by
-	// workload; the control plane maps it to the workload's current deployment. Drained
-	// once, so a report is sent a single time.
+	// still serving (a redeploy) or, failing that, a synthesised crashed entry. The report
+	// carries its deploymentId, so the control plane attaches the outcome to the exact
+	// deployment that ran it. Drained once, so a report is sent a single time.
 	if rel := a.docker.TakeReleaseReports(); len(rel) > 0 {
 		for i := range health {
 			if r, ok := rel[health[i].WorkloadID]; ok {
