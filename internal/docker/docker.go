@@ -691,23 +691,30 @@ func (e *engineClient) runRelease(ctx context.Context, spec contract.WorkloadSpe
 		}
 	}
 
+	// Attach to the container's stdout+stderr BEFORE starting it, so we capture the whole
+	// output stream from the first byte. Attach reads the live stream directly, independent
+	// of the host's Docker logging driver: ContainerLogs (the previous approach) reads back
+	// through that driver, and on a host whose driver does not serve `docker logs` it returns
+	// nothing, which is why a real "No pending migrations to apply" release showed as
+	// "succeeded, no output". This is exactly how `docker run` / `docker start -a` stream a
+	// container's output. The container has no TTY, so the stream is multiplexed; StdCopy
+	// demuxes it into stdout and stderr.
+	var out, errb bytes.Buffer
+	attach, attachErr := e.cli.ContainerAttach(ctx, created.ID, container.AttachOptions{
+		Stream: true, Stdout: true, Stderr: true,
+	})
+
 	if err := e.cli.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
+		if attachErr == nil {
+			attach.Close()
+		}
 		return fmt.Errorf("starting release container: %w", err)
 	}
 
-	// Follow the combined output to EOF (the stream ends when the container stops), so we
-	// capture the full release log from the start regardless of the host log driver or any
-	// post-exit flush race. Reading logs only AFTER ContainerWait returned could come back
-	// empty (the driver may not have flushed yet), which is why a real "No pending migrations"
-	// release showed as "succeeded, no output". ContainerLogs without Since replays from the
-	// beginning before following, so attaching just after start loses nothing. This follow
-	// read also serves as our wait; ContainerWait below then just yields the exit code.
-	var out, errb bytes.Buffer
-	if logs, logErr := e.cli.ContainerLogs(ctx, created.ID, container.LogsOptions{
-		ShowStdout: true, ShowStderr: true, Follow: true,
-	}); logErr == nil {
-		_, _ = stdcopy.StdCopy(&out, &errb, logs)
-		_ = logs.Close()
+	// Drain the attached stream to EOF; it ends when the container's stdio closes on exit.
+	if attachErr == nil {
+		_, _ = stdcopy.StdCopy(&out, &errb, attach.Reader)
+		attach.Close()
 	}
 
 	statusCh, errCh := e.cli.ContainerWait(ctx, created.ID, container.WaitConditionNotRunning)
