@@ -733,6 +733,9 @@ func (e *engineClient) stashReleaseReport(spec contract.WorkloadSpec, containerI
 		log += "[error] " + runErr.Error() + "\n"
 	}
 	e.releaseMu.Lock()
+	if e.releaseReports == nil {
+		e.releaseReports = map[string]*contract.ReleaseReport{}
+	}
 	e.releaseReports[spec.ID] = &contract.ReleaseReport{Status: status, Log: log}
 	e.releaseMu.Unlock()
 }
