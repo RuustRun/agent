@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -650,10 +651,16 @@ func (e *engineClient) runRelease(ctx context.Context, spec contract.WorkloadSpe
 	}
 	name := fmt.Sprintf("ruust-release-%s-%d", strings.ToLower(spec.ID), time.Now().UnixNano())
 	config := &container.Config{
-		Image:  spec.ImageRef,
-		Env:    env,
-		Cmd:    []string{"sh", "-c", spec.ReleaseCommand},
-		Labels: map[string]string{LabelPrefix + ".release": spec.ID},
+		Image: spec.ImageRef,
+		Env:   env,
+		Cmd:   []string{"sh", "-c", spec.ReleaseCommand},
+		// AttachStdout/AttachStderr must be set for ContainerAttach to receive the
+		// container's output; `docker run` sets them and we did not, which is why the
+		// attached stream came back empty. Belt and braces alongside the ContainerLogs
+		// fallback below.
+		AttachStdout: true,
+		AttachStderr: true,
+		Labels:       map[string]string{LabelPrefix + ".release": spec.ID},
 	}
 
 	// Join the base Egg bridge (so it resolves) plus the peer networks below, so the
@@ -692,13 +699,9 @@ func (e *engineClient) runRelease(ctx context.Context, spec contract.WorkloadSpe
 	}
 
 	// Attach to the container's stdout+stderr BEFORE starting it, so we capture the whole
-	// output stream from the first byte. Attach reads the live stream directly, independent
-	// of the host's Docker logging driver: ContainerLogs (the previous approach) reads back
-	// through that driver, and on a host whose driver does not serve `docker logs` it returns
-	// nothing, which is why a real "No pending migrations to apply" release showed as
-	// "succeeded, no output". This is exactly how `docker run` / `docker start -a` stream a
-	// container's output. The container has no TTY, so the stream is multiplexed; StdCopy
-	// demuxes it into stdout and stderr.
+	// output stream from the first byte (the config sets AttachStdout/AttachStderr so the
+	// daemon wires the streams). The container has no TTY, so the stream is multiplexed;
+	// StdCopy demuxes it into stdout and stderr.
 	var out, errb bytes.Buffer
 	attach, attachErr := e.cli.ContainerAttach(ctx, created.ID, container.AttachOptions{
 		Stream: true, Stdout: true, Stderr: true,
@@ -732,10 +735,46 @@ func (e *engineClient) runRelease(ctx context.Context, spec contract.WorkloadSpe
 		runErr = ctx.Err()
 	}
 
+	// Fallback: if the attached stream captured nothing (some daemons do not deliver a
+	// one-shot container's stdio to attach), read the container's logs the same way the
+	// runtime log path does, which is proven to work on this host. The container still
+	// exists here (removal is deferred), so this reads its full output.
+	attachBytes := out.Len() + errb.Len()
+	if attachBytes == 0 {
+		if rc, logErr := e.cli.ContainerLogs(ctx, created.ID, container.LogsOptions{
+			ShowStdout: true, ShowStderr: true,
+		}); logErr == nil {
+			_, _ = stdcopy.StdCopy(&out, &errb, rc)
+			_ = rc.Close()
+		}
+	}
+
+	// Diagnostic breadcrumb (no secrets: the release command is not an env value, and env
+	// values are redacted from the captured output separately). Tells us, from journald,
+	// exactly what ran and which capture path produced bytes, so a "no output" report is
+	// never a mystery again.
+	slog.Info("release complete",
+		"workloadId", spec.ID,
+		"deploymentId", spec.DeploymentID,
+		"cmd", spec.ReleaseCommand,
+		"exitErr", errString(runErr),
+		"attachErr", errString(attachErr),
+		"attachBytes", attachBytes,
+		"totalBytes", out.Len()+errb.Len(),
+	)
+
 	// Record the outcome and captured output for the deploy's Release log, on success and
 	// failure alike. A log-read failure never changes the outcome, which the exit code decides.
 	e.stashReleaseReport(spec, combineStreams(out.String(), errb.String()), runErr)
 	return runErr
+}
+
+// errString renders an error for a structured log field, "" for nil.
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // combineStreams joins captured stdout and stderr into one log, stdout first, with a
