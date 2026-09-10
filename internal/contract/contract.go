@@ -544,6 +544,11 @@ type ContainerHealth struct {
 	// Backup, when set, reports backup capture/restore progress for a database Egg.
 	// Nil when there is no active backup. See BackupReport.
 	Backup *BackupReport `json:"backup,omitempty"`
+	// Release, when set, reports the outcome and captured output of the one-shot release
+	// command (e.g. migrations) the agent ran before rolling this workload, so the control
+	// plane can show it as a Release log on the deploy. Nil when the workload has no release
+	// command, or none ran this cycle. See ReleaseReport.
+	Release *ReleaseReport `json:"release,omitempty"`
 }
 
 // BuildReport is host-side build progress for a workload the agent is building
@@ -589,6 +594,18 @@ type BackupReport struct {
 	// Checksum is the snapshot sha256 on a capture "done".
 	Checksum string `json:"checksum,omitempty"`
 	// Log is incremental, redacted output since the last report (may be empty).
+	Log string `json:"log,omitempty"`
+}
+
+// ReleaseReport is the outcome and captured output of a workload's one-shot release
+// command (e.g. database migrations), run once before the workload rolls. Distinct from
+// the build (which produces the image) and the runtime Logs (the serving container): this
+// drives the dashboard's Release log for a deploy. The log is captured in full after the
+// release container exits (not incremental), and is redacted of env values.
+type ReleaseReport struct {
+	// Status is the release outcome: "succeeded" or "failed".
+	Status string `json:"status"`
+	// Log is the release container's full combined output (stdout+stderr), redacted.
 	Log string `json:"log,omitempty"`
 }
 

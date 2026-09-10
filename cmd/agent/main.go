@@ -910,6 +910,29 @@ func (a *agent) reportStatus(ctx context.Context, appliedVersion string) {
 		a.pendingBuilds = nil
 	}
 
+	// Release-command reports (e.g. migrations). The release runs synchronously during
+	// Create, so a successful one rides on the now-running container's health entry; a
+	// failed release leaves no new container, so its report attaches to an old container
+	// still serving (a redeploy) or, failing that, a synthesised crashed entry. Keyed by
+	// workload; the control plane maps it to the workload's current deployment. Drained
+	// once, so a report is sent a single time.
+	if rel := a.docker.TakeReleaseReports(); len(rel) > 0 {
+		for i := range health {
+			if r, ok := rel[health[i].WorkloadID]; ok {
+				health[i].Release = r
+				delete(rel, health[i].WorkloadID)
+			}
+		}
+		for wid, r := range rel {
+			health = append(health, contract.ContainerHealth{
+				WorkloadID: wid,
+				State:      contract.StateCrashed,
+				Usage:      contract.CgroupUsage{},
+				Release:    r,
+			})
+		}
+	}
+
 	// Data-import reports. The import loads into a RUNNING container, so its report
 	// always rides on that container's existing health entry (no synthetic entry
 	// needed). Cleared after use so a report without a fresh tick does not resend.
