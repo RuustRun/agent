@@ -493,6 +493,12 @@ type DesiredState struct {
 	// the box has booted since (so it is idempotent across polls). Empty = none.
 	// Deliberately outside the version hash: a reboot must not roll workloads.
 	RebootRequestedAt string `json:"rebootRequestedAt,omitempty"`
+	// IngressEnabled controls whether this host serves public ingress. When true (or
+	// absent, for an older control plane) the agent pushes per-Egg routes and on-demand
+	// TLS to the local Caddy; when false it tears them down, so the host runs Eggs
+	// privately. A pointer so absent (nil) is distinguishable from an explicit false and
+	// defaults to on. Outside the version hash: toggling ingress must not roll workloads.
+	IngressEnabled *bool `json:"ingressEnabled,omitempty"`
 	// CancelledDeploymentIDs are deployments whose in-flight build on this host
 	// should be stopped (cancelled by a customer/admin, or superseded by a newer
 	// deploy). The agent SIGTERMs the matching build if still running; unknown ids
@@ -628,6 +634,23 @@ type LogLine struct {
 	Text string `json:"text"`
 }
 
+// IngressHealth is the local Caddy ingress health the agent reports each heartbeat.
+type IngressHealth struct {
+	// Ready is true when Caddy's admin API is reachable and the last config push applied.
+	Ready bool `json:"ready"`
+	// Listening is true when Caddy is bound to the public ports (80/443).
+	Listening bool `json:"listening"`
+	// Certs is the per-hostname certificate state, so an Egg's cert can show its status.
+	Certs []CertStatusReport `json:"certs,omitempty"`
+}
+
+// CertStatusReport is one Egg hostname's certificate state, as seen by the local Caddy.
+type CertStatusReport struct {
+	Hostname string `json:"hostname"`
+	// Status is "issued", "pending", or "failed".
+	Status string `json:"status"`
+}
+
 // HostStatus is the status report from the agent, sent to
 // POST /api/v1/hosts/:id/status.
 //
@@ -675,6 +698,9 @@ type HostStatus struct {
 	// back from (quarantined). Always sent (even empty, no omitempty) so the control
 	// plane can clear the alert once the node's quarantine is cleared.
 	RolledBack []string `json:"rolledBack"`
+	// Ingress is the local Caddy ingress health, so the console can show whether the
+	// host's public front door works. Nil on a host with no Caddy (a workload-only host).
+	Ingress *IngressHealth `json:"ingress,omitempty"`
 	// Containers is the health of every container the agent is currently running.
 	Containers []ContainerHealth `json:"containers"`
 	// AgentLogs is the agent's OWN recent log output (a rolling window, not

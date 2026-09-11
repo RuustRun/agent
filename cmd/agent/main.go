@@ -566,6 +566,14 @@ func (a *agent) tick(ctx context.Context) {
 					}
 				}
 			}
+			// Honour the customer ingress toggle: an explicit false tears the routes down
+			// (Caddy stays up but serves nothing, so the host runs its Eggs privately with
+			// no public front door). Absent (nil) or true serves them, so an older control
+			// plane that sends no flag keeps working. cfg.ingressEnabled above means Caddy
+			// exists on this host at all.
+			if desired.IngressEnabled != nil && !*desired.IngressEnabled {
+				routes = nil
+			}
 			if err := a.ingress.Reconcile(ctx, routes); err != nil {
 				a.log.Warn("could not reconcile ingress", "err", err)
 			}
@@ -986,6 +994,14 @@ func (a *agent) reportStatus(ctx context.Context, appliedVersion string) {
 		RolledBack:      quarantinedList(),
 		Containers:      health,
 		AgentLogs:       a.logs.snapshot(),
+	}
+
+	// Ingress health, only on a host that actually runs Caddy (an ingress node). The
+	// probe is best-effort and never blocks the heartbeat; a workload-only host reports
+	// no ingress at all, which the console shows as "not set up".
+	if a.cfg.ingressEnabled && a.ingress != nil {
+		ih := a.ingress.Health(ctx)
+		status.Ingress = &ih
 	}
 
 	body, err := json.Marshal(status)
