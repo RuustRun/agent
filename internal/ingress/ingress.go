@@ -17,14 +17,20 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
+	"time"
+
+	"github.com/RuustRun/agent/internal/contract"
 )
 
 // Route is one Egg's ingress: the hostnames it serves and the host ports its
@@ -224,4 +230,86 @@ func firstHost(r Route) string {
 		}
 	}
 	return m
+}
+
+// Health probes the local Caddy for a heartbeat report: whether the admin API is
+// reachable, whether the public HTTPS port is listening, and each served hostname's
+// certificate state. Best-effort: every probe degrades to a negative/pending result on
+// failure rather than erroring, so a heartbeat is never blocked by ingress health.
+func (r *Reconciler) Health(ctx context.Context) contract.IngressHealth {
+	h := contract.IngressHealth{
+		Ready:     r.adminReachable(ctx),
+		Listening: dialable("127.0.0.1:443"),
+	}
+	r.mu.RLock()
+	hosts := make([]string, 0, len(r.allowed))
+	for hn := range r.allowed {
+		hosts = append(hosts, hn)
+	}
+	r.mu.RUnlock()
+	sort.Strings(hosts)
+	for _, hn := range hosts {
+		h.Certs = append(h.Certs, contract.CertStatusReport{Hostname: hn, Status: r.probeCert(ctx, hn)})
+	}
+	return h
+}
+
+// adminReachable is true when Caddy's admin API answers, which also proves our last
+// config push had somewhere to land.
+func (r *Reconciler) adminReachable(ctx context.Context) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.adminURL+"/config/", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := r.http.Do(req)
+	if err != nil {
+		return false
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode < 300
+}
+
+// dialable reports whether a TCP connection to addr succeeds within a short timeout.
+func dialable(addr string) bool {
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+// probeCert does a local TLS handshake with SNI = hostname and inspects the served leaf
+// certificate. A cert that covers the hostname (and, in production, is not Caddy's
+// internal CA) is "issued"; anything else is "pending". The probe legitimately triggers
+// on-demand issuance (the ask endpoint already allows the hostname), so a cert gets
+// minted proactively rather than waiting for the first real user request. We skip
+// verification because we only inspect the cert, we do not trust the connection.
+func (r *Reconciler) probeCert(ctx context.Context, hostname string) string {
+	dctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	d := &tls.Dialer{Config: &tls.Config{ServerName: hostname, InsecureSkipVerify: true}} //nolint:gosec // inspection only
+	conn, err := d.DialContext(dctx, "tcp", "127.0.0.1:443")
+	if err != nil {
+		return "pending"
+	}
+	defer func() { _ = conn.Close() }()
+	tconn, ok := conn.(*tls.Conn)
+	if !ok {
+		return "pending"
+	}
+	certs := tconn.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		return "pending"
+	}
+	leaf := certs[0]
+	if leaf.VerifyHostname(hostname) != nil {
+		return "pending" // the served cert does not (yet) cover this hostname
+	}
+	// In production we expect a real (Let's Encrypt) cert; an internal-CA cert means
+	// on-demand ACME has not issued yet. Locally the internal CA IS the expected issuer.
+	if !r.localTLS && strings.Contains(leaf.Issuer.CommonName, "Caddy Local Authority") {
+		return "pending"
+	}
+	return "issued"
 }
