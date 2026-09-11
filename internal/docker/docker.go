@@ -182,6 +182,11 @@ type Client interface {
 	// TakeReleaseReports returns and clears the release-command outcomes captured since
 	// the last call, keyed by workload ID, for the agent to attach to its status report.
 	TakeReleaseReports() map[string]*contract.ReleaseReport
+	// Shell runs an interactive PTY shell inside the given container, bridging stdin from
+	// `in`, terminal output to `out`, and window resizes from `resize`. Blocks until the
+	// shell exits or the context is cancelled. The CALLER must have authorised the
+	// container; Shell does not itself authorise.
+	Shell(ctx context.Context, containerID string, in io.Reader, out io.Writer, resize <-chan ShellResize) error
 	// Close releases any underlying SDK resources.
 	Close() error
 }

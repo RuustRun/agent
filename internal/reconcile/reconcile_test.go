@@ -3,6 +3,7 @@ package reconcile
 import (
 	"context"
 	"fmt"
+	"io"
 	"sort"
 	"testing"
 
@@ -101,6 +102,10 @@ func (f *fakeClient) Logs(_ context.Context, _ string, _ string) ([]contract.Log
 }
 
 func (f *fakeClient) TakeReleaseReports() map[string]*contract.ReleaseReport { return nil }
+
+func (f *fakeClient) Shell(_ context.Context, _ string, _ io.Reader, _ io.Writer, _ <-chan docker.ShellResize) error {
+	return nil
+}
 
 func (f *fakeClient) Close() error { return nil }
 
