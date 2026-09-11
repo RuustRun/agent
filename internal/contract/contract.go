@@ -504,6 +504,18 @@ type DesiredState struct {
 	// deploy). The agent SIGTERMs the matching build if still running; unknown ids
 	// are ignored. Outside the version hash: cancelling never rolls workloads.
 	CancelledDeploymentIDs []string `json:"cancelledDeploymentIds,omitempty"`
+	// ShellSessions are pending interactive shell requests for workloads on this host.
+	// For each, the agent dials the relay, execs an interactive PTY into the workload's
+	// live container, and bridges the two. Only a container this host runs. Outside the
+	// version hash: a shell request never rolls a workload.
+	ShellSessions []ShellSessionRequest `json:"shellSessions,omitempty"`
+}
+
+// ShellSessionRequest is one pending interactive shell: its session id (used to pair the
+// agent's relay WebSocket with the client's) and the workload to exec into.
+type ShellSessionRequest struct {
+	ID         string `json:"id"`
+	WorkloadID string `json:"workloadId"`
 }
 
 // CgroupUsage is the measured cgroup v2 usage for one container. Egress is

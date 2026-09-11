@@ -47,6 +47,7 @@ import (
 	"runtime/debug"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -200,6 +201,11 @@ type agent struct {
 	// appliedVersion is the last desired-state version the agent successfully
 	// converged to. It lets the agent no-op cheaply whilst the hash is unchanged.
 	appliedVersion string
+
+	// shellActive tracks interactive shell sessions currently being handled (keyed by
+	// session id), so a session that lingers in desired-state until closed is only ever
+	// bridged once. Written from goroutines, so a sync.Map.
+	shellActive sync.Map
 
 	// logSince tracks, per container ID, the timestamp of the newest log line
 	// already shipped, so each report carries only new output (incremental). The
@@ -579,6 +585,10 @@ func (a *agent) tick(ctx context.Context) {
 			}
 		}
 	}
+
+	// Bridge any pending interactive shell sessions for workloads on this host. Each runs
+	// in its own goroutine and does not block convergence or the status report.
+	a.handleShellSessions(ctx, desired.ShellSessions)
 
 	a.reportStatus(ctx, a.appliedVersion)
 
