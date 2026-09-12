@@ -764,3 +764,37 @@ type HostStatus struct {
 	// without shell access. May be empty. Never contains secrets.
 	AgentLogs []LogLine `json:"agentLogs,omitempty"`
 }
+
+// ProvisioningManifest is the OS-level host state the control plane wants, returned by
+// GET /api/v1/hosts/:id/provisioning and applied by the root `ruust-agent provision`
+// reconciler on a timer. Pull-based like everything else: the control plane never dials
+// a host. Generation changes whenever any input below changes, so the reconciler is a
+// cheap no-op when it matches the generation it last applied, and never re-applies on an
+// unchanged host. Every field is desired-state the agent converges idempotently; an
+// older agent ignores what it does not understand. This carries the privileged host
+// substrate (firewall, packages, agent capabilities) that the agent's own unprivileged
+// loop cannot change, so a host stays current with no re-enrol. It does NOT carry
+// workloads or secrets (those stay on desired-state).
+type ProvisioningManifest struct {
+	// Generation bumps on any provisioning change; the reconciler applies only when it
+	// differs from the generation it last applied. A stable hash of the inputs below.
+	Generation string `json:"generation"`
+	// Firewall is the Egg egress firewall policy. Nil leaves the agent's built-in rules.
+	Firewall *FirewallConfig `json:"firewall,omitempty"`
+	// Packages are OS packages the host must have for the agent to do its job (egress
+	// shaping needs iproute2 + util-linux). The reconciler installs any that are missing.
+	Packages []string `json:"packages,omitempty"`
+	// AgentNetworkCaps is true when the agent's systemd unit must carry the network
+	// capabilities (CAP_NET_ADMIN/CAP_SYS_ADMIN + the setns syscall) that egress shaping
+	// needs. The reconciler rewrites the unit and restarts the agent only if missing.
+	AgentNetworkCaps bool `json:"agentNetworkCaps,omitempty"`
+}
+
+// FirewallConfig is the Egg egress firewall policy, applied on top of the static
+// metadata/RFC1918/host blocks the reconciler always writes.
+type FirewallConfig struct {
+	// BlockedOutboundPorts are outbound TCP ports blocked from Egg containers, to stop
+	// direct-to-MX SMTP abuse. 25 by default; submission ports 587/465 stay open for
+	// authenticated relays.
+	BlockedOutboundPorts []int `json:"blockedOutboundPorts"`
+}

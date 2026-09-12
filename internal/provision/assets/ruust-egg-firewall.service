@@ -1,0 +1,24 @@
+# ruust-egg-firewall.service
+#
+# Applies the Egg egress firewall (/opt/ruust/firewall/egg-egress.sh) at boot and
+# whenever Docker restarts, because Docker recreates the DOCKER-USER chain then.
+# Written out by `ruust-agent provision`. The blocked-ports list is read from
+# /etc/ruust/egg-firewall.env, which the reconciler renders from the control plane's
+# provisioning manifest. British English. No em dashes.
+
+[Unit]
+Description=Ruust Egg egress firewall
+After=docker.service
+PartOf=docker.service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/ruust/egg-firewall.env
+ExecStart=/opt/ruust/firewall/egg-egress.sh
+SyslogIdentifier=ruust-egg-firewall
+
+[Install]
+WantedBy=multi-user.target
