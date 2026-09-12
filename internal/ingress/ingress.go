@@ -247,19 +247,20 @@ func ruustServer(httpRoutes []map[string]any, limits *contract.IngressConfig) ma
 		"routes": httpRoutes,
 	}
 	if limits != nil {
-		timeouts := map[string]any{}
+		// Caddy v2 carries these as direct fields on the server, there is NO "timeouts"
+		// object (an earlier version used one and Caddy rejected the whole config with a
+		// 400 "unknown field timeouts", freezing ingress). read_timeout bounds reading the
+		// whole request, read_header_timeout the headers (the slowloris defence); write and
+		// idle bound the response and the keep-alive. Durations are Caddy duration strings.
 		if limits.ReadTimeout != "" {
-			timeouts["read_body"] = limits.ReadTimeout
-			timeouts["read_header"] = limits.ReadTimeout
+			server["read_timeout"] = limits.ReadTimeout
+			server["read_header_timeout"] = limits.ReadTimeout
 		}
 		if limits.WriteTimeout != "" {
-			timeouts["write"] = limits.WriteTimeout
+			server["write_timeout"] = limits.WriteTimeout
 		}
 		if limits.IdleTimeout != "" {
-			timeouts["idle"] = limits.IdleTimeout
-		}
-		if len(timeouts) > 0 {
-			server["timeouts"] = timeouts
+			server["idle_timeout"] = limits.IdleTimeout
 		}
 	}
 	return server
