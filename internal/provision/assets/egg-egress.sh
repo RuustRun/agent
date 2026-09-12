@@ -15,6 +15,12 @@
 # to the host itself, and from opening direct SMTP to spam the internet. General
 # internet egress stays open, because egress is unmetered on every tier.
 #
+# CRUCIAL: the forwarded drops fire only when traffic LEAVES the Ruust bridges
+# (! -o ruust+, i.e. out to the host or the physical network). Traffic that stays
+# between Ruust containers (a peered Egg reaching its database over a private
+# ruust-<hash> bridge, in-in on ruust+) is never touched here, so private
+# networking keeps working. Cross-container isolation is Docker's job (ICC).
+#
 # Forwarded traffic is filtered in Docker's DOCKER-USER chain, which Docker
 # guarantees is evaluated first in the FORWARD path and never clobbers.
 # Host-destined traffic is filtered in a dedicated INPUT chain that still allows
@@ -64,19 +70,36 @@ if ! iptables -L DOCKER-USER -n >/dev/null 2>&1; then
   exit 0
 fi
 
-# --- Forwarded egress: block metadata and the private ranges (DOCKER-USER). ---
+# --- Purge the pre-fix, UNGUARDED form of these drops (no ! -o), which also caught
+#     peer-to-peer traffic and broke private networking. A host that ran an earlier
+#     version keeps those rules until removed, and the add-only loops below would not
+#     replace them. Delete every instance before adding the guarded form. ---
 for cidr in "${BLOCKED_V4[@]}"; do
-  if ! iptables -C DOCKER-USER -i "$IFACE" -d "$cidr" -j DROP 2>/dev/null; then
-    iptables -I DOCKER-USER -i "$IFACE" -d "$cidr" -j DROP
+  while iptables -C DOCKER-USER -i "$IFACE" -d "$cidr" -j DROP 2>/dev/null; do
+    iptables -D DOCKER-USER -i "$IFACE" -d "$cidr" -j DROP
+  done
+done
+for port in $BLOCKED_SMTP_PORTS; do
+  while iptables -C DOCKER-USER -i "$IFACE" -p tcp --dport "$port" -j DROP 2>/dev/null; do
+    iptables -D DOCKER-USER -i "$IFACE" -p tcp --dport "$port" -j DROP
+  done
+done
+
+# --- Forwarded egress: block metadata and the private ranges, but only when the
+#     traffic is leaving the Ruust bridges (! -o ruust+). Peer-to-peer traffic
+#     that stays on a ruust bridge is left alone, so private networking works. ---
+for cidr in "${BLOCKED_V4[@]}"; do
+  if ! iptables -C DOCKER-USER -i "$IFACE" ! -o "$IFACE" -d "$cidr" -j DROP 2>/dev/null; then
+    iptables -I DOCKER-USER -i "$IFACE" ! -o "$IFACE" -d "$cidr" -j DROP
   fi
 done
 
 # --- Forwarded egress: block direct outbound SMTP so an Egg cannot spam
 #     straight to recipients' mail servers (anti-abuse, reputation). Submission
-#     to an authenticated relay (587/465) stays open. ---
+#     to an authenticated relay (587/465) stays open. Leaving the bridges only. ---
 for port in $BLOCKED_SMTP_PORTS; do
-  if ! iptables -C DOCKER-USER -i "$IFACE" -p tcp --dport "$port" -j DROP 2>/dev/null; then
-    iptables -I DOCKER-USER -i "$IFACE" -p tcp --dport "$port" -j DROP
+  if ! iptables -C DOCKER-USER -i "$IFACE" ! -o "$IFACE" -p tcp --dport "$port" -j DROP 2>/dev/null; then
+    iptables -I DOCKER-USER -i "$IFACE" ! -o "$IFACE" -p tcp --dport "$port" -j DROP
   fi
 done
 
@@ -94,14 +117,25 @@ fi
 #     Block the IPv6 metadata address, ULA and link-local; general v6 egress
 #     stays open. ---
 if command -v ip6tables >/dev/null 2>&1 && ip6tables -L DOCKER-USER -n >/dev/null 2>&1; then
+  # Purge the pre-fix unguarded v6 form first (see the v4 note above).
   for cidr in "fd00:ec2::254/128" "fc00::/7" "fe80::/10"; do
-    if ! ip6tables -C DOCKER-USER -i "$IFACE" -d "$cidr" -j DROP 2>/dev/null; then
-      ip6tables -I DOCKER-USER -i "$IFACE" -d "$cidr" -j DROP
+    while ip6tables -C DOCKER-USER -i "$IFACE" -d "$cidr" -j DROP 2>/dev/null; do
+      ip6tables -D DOCKER-USER -i "$IFACE" -d "$cidr" -j DROP
+    done
+  done
+  for port in $BLOCKED_SMTP_PORTS; do
+    while ip6tables -C DOCKER-USER -i "$IFACE" -p tcp --dport "$port" -j DROP 2>/dev/null; do
+      ip6tables -D DOCKER-USER -i "$IFACE" -p tcp --dport "$port" -j DROP
+    done
+  done
+  for cidr in "fd00:ec2::254/128" "fc00::/7" "fe80::/10"; do
+    if ! ip6tables -C DOCKER-USER -i "$IFACE" ! -o "$IFACE" -d "$cidr" -j DROP 2>/dev/null; then
+      ip6tables -I DOCKER-USER -i "$IFACE" ! -o "$IFACE" -d "$cidr" -j DROP
     fi
   done
   for port in $BLOCKED_SMTP_PORTS; do
-    if ! ip6tables -C DOCKER-USER -i "$IFACE" -p tcp --dport "$port" -j DROP 2>/dev/null; then
-      ip6tables -I DOCKER-USER -i "$IFACE" -p tcp --dport "$port" -j DROP
+    if ! ip6tables -C DOCKER-USER -i "$IFACE" ! -o "$IFACE" -p tcp --dport "$port" -j DROP 2>/dev/null; then
+      ip6tables -I DOCKER-USER -i "$IFACE" ! -o "$IFACE" -p tcp --dport "$port" -j DROP
     fi
   done
 fi
