@@ -101,6 +101,14 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(io.MultiWriter(os.Stdout, logs), &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
+	// Subcommands. `provision` is the root host-provisioning reconciler, run by its own
+	// systemd unit on a timer, separately from the main loop. It needs no Docker and must
+	// not touch the self-update probation counter (which tracks main-loop boots), so it
+	// dispatches before anything else.
+	if len(os.Args) > 1 && os.Args[1] == "provision" {
+		os.Exit(runProvision(logger))
+	}
+
 	// If we just self-updated, count this boot before doing anything that could
 	// fail: a bad build that crashes during startup still increments the attempt
 	// count, and after a few tries we roll back to the previous binary. Must be the
