@@ -509,6 +509,11 @@ type DesiredState struct {
 	// live container, and bridges the two. Only a container this host runs. Outside the
 	// version hash: a shell request never rolls a workload.
 	ShellSessions []ShellSessionRequest `json:"shellSessions,omitempty"`
+	// HostConfig carries operational fair-use tunables the agent applies OUT OF BAND:
+	// per-Egg egress rate caps, and the ingress hardening defaults. A pointer so a nil
+	// (absent) block means "use built-in behaviour" for an older control plane. Outside
+	// the version hash: tweaking any of these must never, by itself, roll a workload.
+	HostConfig *HostConfig `json:"hostConfig,omitempty"`
 }
 
 // ShellSessionRequest is one pending interactive shell: its session id (used to pair the
@@ -516,6 +521,39 @@ type DesiredState struct {
 type ShellSessionRequest struct {
 	ID         string `json:"id"`
 	WorkloadID string `json:"workloadId"`
+}
+
+// HostConfig is the set of operational fair-use tunables applied out of band (never
+// part of the version hash). Every field is optional; a nil sub-block leaves that
+// dimension at the agent's built-in behaviour.
+type HostConfig struct {
+	Egress  *EgressConfig  `json:"egress,omitempty"`
+	Ingress *IngressConfig `json:"ingress,omitempty"`
+}
+
+// EgressConfig is the network egress fair-use policy for this host.
+type EgressConfig struct {
+	// Enforce is the master switch. False means the agent removes any egress shaping.
+	Enforce bool `json:"enforce"`
+	// Caps are the per-workload egress ceilings, in bytes per second (0 = unlimited).
+	Caps []EgressCap `json:"caps"`
+}
+
+// EgressCap is one workload's egress ceiling.
+type EgressCap struct {
+	WorkloadID     string `json:"workloadId"`
+	BytesPerSecond int64  `json:"bytesPerSecond"`
+}
+
+// IngressConfig is the ingress hardening the agent applies to the local Caddy. The
+// timeouts are Caddy duration strings ("30s"); an empty string leaves that timeout
+// unset. MaxBodyBytes of 0 means no request-body cap.
+type IngressConfig struct {
+	ReadTimeout  string `json:"readTimeout,omitempty"`
+	IdleTimeout  string `json:"idleTimeout,omitempty"`
+	WriteTimeout string `json:"writeTimeout,omitempty"`
+	DialTimeout  string `json:"dialTimeout,omitempty"`
+	MaxBodyBytes int64  `json:"maxBodyBytes,omitempty"`
 }
 
 // CgroupUsage is the measured cgroup v2 usage for one container. Egress is
@@ -713,6 +751,12 @@ type HostStatus struct {
 	// Ingress is the local Caddy ingress health, so the console can show whether the
 	// host's public front door works. Nil on a host with no Caddy (a workload-only host).
 	Ingress *IngressHealth `json:"ingress,omitempty"`
+	// QuotaEnforced is true when this host can hard-enforce a per-volume size quota
+	// (its data filesystem is xfs mounted with prjquota and the agent has the scoped
+	// xfs_quota privilege), false when volume sizes are advisory only. A pointer so a
+	// host that has not probed yet (nil) stays distinct from a real false, and the
+	// control plane can show operators which hosts actually cap disk.
+	QuotaEnforced *bool `json:"quotaEnforced,omitempty"`
 	// Containers is the health of every container the agent is currently running.
 	Containers []ContainerHealth `json:"containers"`
 	// AgentLogs is the agent's OWN recent log output (a rolling window, not
