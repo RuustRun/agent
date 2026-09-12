@@ -1083,6 +1083,9 @@ func (a *agent) reportStatus(ctx context.Context, appliedVersion string) {
 		RolledBack:      quarantinedList(),
 		Containers:      health,
 		AgentLogs:       a.logs.snapshot(),
+		// Whether this host can hard-enforce per-volume disk quotas (xfs + prjquota).
+		// nil on a dev box (not probed); a real true/false on a Linux host.
+		QuotaEnforced: hostcap.QuotaEnforced(),
 	}
 
 	// Ingress health, only on a host that actually runs Caddy (an ingress node). The
