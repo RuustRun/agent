@@ -587,7 +587,12 @@ func (a *agent) tick(ctx context.Context) {
 			if desired.IngressEnabled != nil && !*desired.IngressEnabled {
 				routes = nil
 			}
-			if err := a.ingress.Reconcile(ctx, routes); err != nil {
+			// Operator ingress hardening (timeouts, body cap), out of the version hash.
+			var ingressLimits *contract.IngressConfig
+			if desired.HostConfig != nil {
+				ingressLimits = desired.HostConfig.Ingress
+			}
+			if err := a.ingress.Reconcile(ctx, routes, ingressLimits); err != nil {
 				a.log.Warn("could not reconcile ingress", "err", err)
 			}
 		}
