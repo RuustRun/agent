@@ -80,8 +80,8 @@ func New(adminURL, upstreamHost, askEndpoint string, localTLS bool, log *slog.Lo
 
 // Reconcile pushes the config for the given routes to Caddy if it has changed,
 // and updates the ask allow-list. A no-change reconcile is a cheap hash compare.
-func (r *Reconciler) Reconcile(ctx context.Context, routes []Route) error {
-	cfg, allowed := r.build(routes)
+func (r *Reconciler) Reconcile(ctx context.Context, routes []Route, limits *contract.IngressConfig) error {
+	cfg, allowed := r.build(routes, limits)
 	body, err := json.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("marshal caddy config: %w", err)
@@ -145,8 +145,10 @@ func (r *Reconciler) AskHandler() http.HandlerFunc {
 
 // build turns routes into a full Caddy config and the ask allow-list. The config
 // is deterministic (hostnames and routes sorted) so an unchanged desired state
-// hashes identically and skips the reload.
-func (r *Reconciler) build(routes []Route) (map[string]any, map[string]bool) {
+// hashes identically and skips the reload. limits applies the operator's ingress
+// hardening (timeouts and a request-body cap); nil (an older control plane) leaves
+// Caddy at its defaults.
+func (r *Reconciler) build(routes []Route, limits *contract.IngressConfig) (map[string]any, map[string]bool) {
 	allowed := map[string]bool{}
 	httpRoutes := make([]map[string]any, 0, len(routes))
 
@@ -178,12 +180,31 @@ func (r *Reconciler) build(routes []Route) (map[string]any, map[string]bool) {
 		for _, h := range hosts {
 			allowed[h] = true
 		}
+		proxy := map[string]any{
+			"handler":   "reverse_proxy",
+			"upstreams": upstreams,
+		}
+		// Bound how long Caddy waits to dial a backend, so a hung Egg does not tie up
+		// the ingress waiting to connect.
+		if limits != nil && limits.DialTimeout != "" {
+			proxy["transport"] = map[string]any{
+				"protocol":     "http",
+				"dial_timeout": limits.DialTimeout,
+			}
+		}
+		handlers := make([]map[string]any, 0, 2)
+		// Cap the request body before it reaches the backend, so a huge upload cannot
+		// be used to exhaust a node. Runs first in the chain.
+		if limits != nil && limits.MaxBodyBytes > 0 {
+			handlers = append(handlers, map[string]any{
+				"handler":  "request_body",
+				"max_size": limits.MaxBodyBytes,
+			})
+		}
+		handlers = append(handlers, proxy)
 		httpRoutes = append(httpRoutes, map[string]any{
-			"match": []map[string]any{{"host": hosts}},
-			"handle": []map[string]any{{
-				"handler":   "reverse_proxy",
-				"upstreams": upstreams,
-			}},
+			"match":  []map[string]any{{"host": hosts}},
+			"handle": handlers,
 		})
 	}
 
@@ -208,15 +229,40 @@ func (r *Reconciler) build(routes []Route) (map[string]any, map[string]bool) {
 			},
 			"http": map[string]any{
 				"servers": map[string]any{
-					"ruust": map[string]any{
-						"listen": []string{":443"},
-						"routes": httpRoutes,
-					},
+					"ruust": ruustServer(httpRoutes, limits),
 				},
 			},
 		},
 	}
 	return cfg, allowed
+}
+
+// ruustServer builds the Caddy HTTP server block, applying the operator's timeouts
+// when present. The read and idle timeouts are the slowloris defence: a client that
+// dribbles a request or holds an idle connection is cut off. Empty strings leave a
+// timeout at Caddy's default.
+func ruustServer(httpRoutes []map[string]any, limits *contract.IngressConfig) map[string]any {
+	server := map[string]any{
+		"listen": []string{":443"},
+		"routes": httpRoutes,
+	}
+	if limits != nil {
+		timeouts := map[string]any{}
+		if limits.ReadTimeout != "" {
+			timeouts["read_body"] = limits.ReadTimeout
+			timeouts["read_header"] = limits.ReadTimeout
+		}
+		if limits.WriteTimeout != "" {
+			timeouts["write"] = limits.WriteTimeout
+		}
+		if limits.IdleTimeout != "" {
+			timeouts["idle"] = limits.IdleTimeout
+		}
+		if len(timeouts) > 0 {
+			server["timeouts"] = timeouts
+		}
+	}
+	return server
 }
 
 func firstHost(r Route) string {

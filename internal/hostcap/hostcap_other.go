@@ -24,3 +24,9 @@ func DetectDisk() (totalGb, freeGb int) {
 	const gb = 1 << 30
 	return int(uint64(st.Blocks) * bsize / gb), int(uint64(st.Bavail) * bsize / gb)
 }
+
+// QuotaEnforced cannot be determined on a non-Linux dev box (no xfs project quotas),
+// so it returns nil (not probed) rather than a misleading false.
+func QuotaEnforced() *bool {
+	return nil
+}

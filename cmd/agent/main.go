@@ -61,6 +61,7 @@ import (
 	"github.com/RuustRun/agent/internal/hostfacts"
 	"github.com/RuustRun/agent/internal/ingress"
 	"github.com/RuustRun/agent/internal/reconcile"
+	"github.com/RuustRun/agent/internal/shaping"
 )
 
 // agentVersion is the version string reported to the control plane. Set via
@@ -226,6 +227,12 @@ type agent struct {
 	// diskUsage caches the last measured volume usage per container id, so du runs at
 	// most once per diskMeasureTTL per container rather than on every status report.
 	diskUsage map[string]diskSample
+
+	// shapedEgress records the egress rate cap (bytes/second, 0 = uncapped) currently
+	// applied to each container id, so egress reconciliation only runs tc when a
+	// container's cap or identity actually changes. Poll loop is single-goroutine, so
+	// this needs no lock.
+	shapedEgress map[string]int64
 
 	// rebootIssued is set once this process has issued a reboot for the current request,
 	// so we do not spam `systemctl reboot` on every tick whilst the box is shutting down.
@@ -580,11 +587,22 @@ func (a *agent) tick(ctx context.Context) {
 			if desired.IngressEnabled != nil && !*desired.IngressEnabled {
 				routes = nil
 			}
-			if err := a.ingress.Reconcile(ctx, routes); err != nil {
+			// Operator ingress hardening (timeouts, body cap), out of the version hash.
+			var ingressLimits *contract.IngressConfig
+			if desired.HostConfig != nil {
+				ingressLimits = desired.HostConfig.Ingress
+			}
+			if err := a.ingress.Reconcile(ctx, routes, ingressLimits); err != nil {
 				a.log.Warn("could not reconcile ingress", "err", err)
 			}
 		}
 	}
+
+	// Apply the per-Egg network egress rate caps (network fair use). Out of the
+	// version hash, so this never rolls a workload; it only shapes the running
+	// containers' netns and self-heals across restarts. Runs on every host (not just
+	// ingress nodes), and only touches tc when a container's cap actually changes.
+	a.reconcileEgress(ctx, desired.HostConfig)
 
 	// Bridge any pending interactive shell sessions for workloads on this host. Each runs
 	// in its own goroutine and does not block convergence or the status report.
@@ -851,6 +869,67 @@ func (a *agent) fetchSecrets(ctx context.Context) (map[string][]string, map[stri
 	return out, tokens, importURLs, nil
 }
 
+// reconcileEgress applies the per-Egg network egress rate caps from hostConfig using
+// Linux tc inside each container's netns (network fair use). It runs on every tick
+// but only invokes tc when a container's cap or identity has actually changed, so a
+// steady state is free. A nil hostConfig/egress (an older control plane) leaves any
+// existing shaping untouched; enforce=false tears it down. This never rolls a
+// workload: it only shapes the running containers.
+func (a *agent) reconcileEgress(ctx context.Context, hc *contract.HostConfig) {
+	if hc == nil || hc.Egress == nil {
+		return // Older control plane, or nothing to say: leave shaping as-is.
+	}
+	if !shaping.Available() {
+		return // Non-Linux dev build, or a host missing tc/nsenter: no-op.
+	}
+	containers, err := a.docker.List(ctx)
+	if err != nil {
+		a.log.Warn("could not list containers for egress shaping", "err", err)
+		return
+	}
+	if a.shapedEgress == nil {
+		a.shapedEgress = make(map[string]int64)
+	}
+
+	// Desired ceiling per workload (bytes/s, 0 = uncapped). With enforce off, every
+	// workload is treated as uncapped so any existing shaping is removed.
+	want := map[string]int64{}
+	if hc.Egress.Enforce {
+		for _, ec := range hc.Egress.Caps {
+			want[ec.WorkloadID] = ec.BytesPerSecond
+		}
+	}
+
+	seen := map[string]bool{}
+	for _, c := range containers {
+		if c.State != contract.StateRunning || c.PID <= 0 {
+			continue
+		}
+		seen[c.ID] = true
+		bps := want[c.WorkloadID] // 0 when uncapped or enforce is off
+		if a.shapedEgress[c.ID] == bps {
+			continue // Already at the desired rate for this exact container.
+		}
+		var serr error
+		if bps > 0 {
+			serr = shaping.Apply(ctx, c.PID, bps)
+		} else {
+			serr = shaping.Clear(ctx, c.PID)
+		}
+		if serr != nil {
+			a.log.Warn("egress shaping failed", "workloadId", c.WorkloadID, "bytesPerSecond", bps, "err", serr)
+			continue
+		}
+		a.shapedEgress[c.ID] = bps
+	}
+	// Forget containers that are gone (their netns, and any qdisc, went with them).
+	for id := range a.shapedEgress {
+		if !seen[id] {
+			delete(a.shapedEgress, id)
+		}
+	}
+}
+
 // reportStatus performs POST /api/v1/hosts/:id/status with per-container health,
 // restart counts and cgroup usage. A failure here is logged and swallowed: the
 // control plane's dead-host timer will notice, and the next tick tries again.
@@ -1004,6 +1083,9 @@ func (a *agent) reportStatus(ctx context.Context, appliedVersion string) {
 		RolledBack:      quarantinedList(),
 		Containers:      health,
 		AgentLogs:       a.logs.snapshot(),
+		// Whether this host can hard-enforce per-volume disk quotas (xfs + prjquota).
+		// nil on a dev box (not probed); a real true/false on a Linux host.
+		QuotaEnforced: hostcap.QuotaEnforced(),
 	}
 
 	// Ingress health, only on a host that actually runs Caddy (an ingress node). The

@@ -144,6 +144,9 @@ type Container struct {
 	// when it is not published, e.g. a database Egg). Ingress load-balances across
 	// the published ports of a workload's live replicas.
 	PublishedPort int
+	// PID is the host PID of the container's init process (0 when not running or not
+	// inspected). Used to enter the container's network namespace for egress shaping.
+	PID int
 	// Legacy is true for a container created by an older agent that predates replica
 	// indexing (no replica label). It is always rolled so the fleet converges onto
 	// the indexed naming.
@@ -287,6 +290,9 @@ func (e *engineClient) List(ctx context.Context) ([]Container, error) {
 			}
 			c.CgroupPath = cgroupPathFor(info)
 			c.PublishedPort = publishedPortFrom(info)
+			if info.State != nil {
+				c.PID = info.State.Pid
+			}
 		}
 		out = append(out, c)
 	}
