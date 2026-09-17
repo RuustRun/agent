@@ -247,6 +247,14 @@ type agent struct {
 	// A fresh process after the reboot starts false, and the boot-time check then keeps
 	// it from rebooting again (the request predates the new boot). Single-goroutine loop.
 	rebootIssued bool
+
+	// latestAgentUpdate is the agent-update pin from the most recent desired-state poll:
+	// the expected binary hash per arch, delivered over the authenticated channel. The
+	// self-update path reads it to verify a download against a hash that did not travel
+	// beside the binary. nil until the first poll (self-update then falls back to the
+	// published .sha256). Written in tick and read in maybeSelfUpdate, both on the single
+	// poll-loop goroutine, so it needs no lock.
+	latestAgentUpdate *contract.AgentUpdate
 }
 
 // diskSample is a cached volume-usage measurement (bytes) and when it was taken.
@@ -367,14 +375,24 @@ func (a *agent) maybeSelfUpdate(ctx context.Context) {
 		return
 	}
 
-	// Integrity: fetch the published sha256 for this build and verify the download
-	// against it before we ever chmod +x and swap it into place. Fail closed: no
-	// verified checksum, no update, so a tampered or corrupt binary is never exec'd
-	// as root. (Stronger provenance, a signature, is a follow-up on top of this.)
-	expected, cerr := a.fetchChecksum(ctx, url+".sha256")
-	if cerr != nil {
-		a.log.Warn("self-update: could not verify checksum, skipping update", "err", cerr)
-		return
+	// Integrity: verify the download against an expected sha256 before we ever chmod +x
+	// and swap it into place. Prefer the hash the control plane PINNED over the
+	// authenticated desired-state channel (host-token, TLS), which an attacker on the open
+	// download path cannot have chosen. Only when the control plane serves no pin (an older
+	// build, or a pin/version race) do we fall back to the published .sha256 fetched beside
+	// the binary. Either way, fail closed: no expected hash, no update, so a tampered or
+	// corrupt binary is never exec'd as root.
+	expected, authenticated := pinnedUpdateHash(a.latestAgentUpdate, target, runtime.GOARCH)
+	if authenticated {
+		a.log.Info("self-update: verifying against the control-plane-pinned hash")
+	} else {
+		h, cerr := a.fetchChecksum(ctx, url+".sha256")
+		if cerr != nil {
+			a.log.Warn("self-update: no pinned hash and could not fetch published checksum, skipping", "err", cerr)
+			return
+		}
+		expected = h
+		a.log.Info("self-update: no pinned hash from the control plane, falling back to the published checksum")
 	}
 
 	// Write to a temp file in the SAME directory so the rename is atomic on one
@@ -458,15 +476,39 @@ func parseSha256(s string) (string, error) {
 		return "", fmt.Errorf("empty checksum")
 	}
 	sum := strings.ToLower(fields[0])
-	if len(sum) != 64 {
-		return "", fmt.Errorf("unexpected checksum length %d", len(sum))
-	}
-	for _, c := range sum {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
-			return "", fmt.Errorf("non-hex checksum")
-		}
+	if !isHexSha256(sum) {
+		return "", fmt.Errorf("malformed checksum")
 	}
 	return sum, nil
+}
+
+// isHexSha256 reports whether s is exactly 64 lowercase hex characters.
+func isHexSha256(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// pinnedUpdateHash returns the control-plane-pinned expected sha256 for a self-update,
+// taken from the authenticated desired-state, and true when one applies. It applies only
+// when the pin names the same version the download endpoint is serving (so the hash and
+// the bytes are the same build) and carries a well-formed digest for this architecture.
+// Otherwise it returns ("", false) and the caller falls back to the published checksum.
+func pinnedUpdateHash(au *contract.AgentUpdate, targetVersion, goarch string) (string, bool) {
+	if au == nil || au.Version == "" || au.Version != targetVersion {
+		return "", false
+	}
+	h := strings.ToLower(au.Sha256.For(goarch))
+	if !isHexSha256(h) {
+		return "", false
+	}
+	return h, true
 }
 
 // tick performs one poll-diff-converge-report cycle. It never returns an error:
@@ -479,6 +521,11 @@ func (a *agent) tick(ctx context.Context) {
 		a.log.Warn("could not fetch desired state, keeping current containers running", "err", err)
 		return
 	}
+
+	// Remember the authenticated agent-update pin for the self-update path, which runs
+	// on its own cadence and verifies a download against this hash rather than one
+	// fetched beside the binary. Absent (older control plane) leaves it nil.
+	a.latestAgentUpdate = desired.AgentUpdate
 
 	if changed {
 		a.log.Info("desired state changed, converging", "version", desired.Version, "workloads", len(desired.Workloads))

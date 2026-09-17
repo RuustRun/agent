@@ -18,6 +18,16 @@ import (
 // firewall, packages, agent capabilities). It needs no Docker. Returns a process exit
 // code.
 func runProvision(logger *slog.Logger) int {
+	// Never run privileged host provisioning with a self-updated binary that has not yet
+	// proven itself. This timer runs as root every couple of minutes, outside the main
+	// agent's crash-loop probation window, so without this gate a bad-but-boot-healthy
+	// build would provision the host as root before probation could roll it back. Defer
+	// (a clean no-op) until the main agent commits or rolls back the update.
+	if isOnProbation() {
+		logger.Info("agent is on post-update probation; deferring host provisioning until the new build is proven healthy")
+		return 0
+	}
+
 	cfg, err := loadConfig()
 	if err != nil {
 		logger.Error("invalid configuration", "err", err)
