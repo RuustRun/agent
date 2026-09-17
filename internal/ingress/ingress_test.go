@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/RuustRun/agent/internal/contract"
@@ -25,6 +26,33 @@ func TestServerTimeoutSchema(t *testing.T) {
 		if _, ok := s[k]; !ok {
 			t.Errorf("server missing direct timeout field %q", k)
 		}
+	}
+}
+
+// TestAdminBindsLoopback locks the Caddy admin API to loopback. The admin API is
+// UNAUTHENTICATED and grants full control of ingress, and Caddy's /load replaces the
+// admin listener with whatever the posted config says, so a 0.0.0.0 bind here would
+// silently expose it on the public interface. It must always be 127.0.0.1.
+func TestAdminBindsLoopback(t *testing.T) {
+	r := New("http://localhost:2019", "127.0.0.1", "http://127.0.0.1:9700/ask", false, slog.Default())
+	cfg, _ := r.build([]Route{{Hostnames: []string{"app.example.com"}, UpstreamPorts: []int{32950}}}, nil)
+
+	admin, ok := cfg["admin"].(map[string]any)
+	if !ok {
+		t.Fatal("config is missing an admin block")
+	}
+	listen, _ := admin["listen"].(string)
+	if listen != "127.0.0.1:2019" {
+		t.Fatalf("admin.listen = %q, want 127.0.0.1:2019 (must never bind a non-loopback interface)", listen)
+	}
+
+	// Belt and braces: the whole serialised config must not mention 0.0.0.0:2019.
+	b, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "0.0.0.0:2019") {
+		t.Fatal("generated config exposes the admin API on 0.0.0.0:2019")
 	}
 }
 
