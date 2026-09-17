@@ -514,6 +514,40 @@ type DesiredState struct {
 	// (absent) block means "use built-in behaviour" for an older control plane. Outside
 	// the version hash: tweaking any of these must never, by itself, roll a workload.
 	HostConfig *HostConfig `json:"hostConfig,omitempty"`
+	// AgentUpdate pins the expected sha256 of the agent binary the control plane wants
+	// this host on, per architecture, delivered over THIS authenticated channel rather
+	// than beside the binary on the open download path. The agent verifies a self-update
+	// download against this hash and refuses a mismatch, so tampering with the download
+	// endpoint or the transit alone cannot install a substituted binary. Nil for an older
+	// control plane (the agent then falls back to the published .sha256). Outside the
+	// version hash: an update pin must never, by itself, roll a workload.
+	AgentUpdate *AgentUpdate `json:"agentUpdate,omitempty"`
+}
+
+// AgentUpdate pins the expected agent binary hash the control plane is serving.
+type AgentUpdate struct {
+	// Version is the pinned release tag, for logging and to scope the hash to a build.
+	Version string `json:"version"`
+	// Sha256 is the expected lowercase-hex sha256 of ruust-agent-linux-<arch>, per arch.
+	Sha256 AgentUpdateHash `json:"sha256"`
+}
+
+// AgentUpdateHash carries the expected binary hash per architecture.
+type AgentUpdateHash struct {
+	Amd64 string `json:"amd64,omitempty"`
+	Arm64 string `json:"arm64,omitempty"`
+}
+
+// For returns the expected hash for a GOARCH value, or "" when none is pinned.
+func (h AgentUpdateHash) For(goarch string) string {
+	switch goarch {
+	case "amd64":
+		return h.Amd64
+	case "arm64":
+		return h.Arm64
+	default:
+		return ""
+	}
 }
 
 // ShellSessionRequest is one pending interactive shell: its session id (used to pair the

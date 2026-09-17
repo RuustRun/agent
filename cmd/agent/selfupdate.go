@@ -140,6 +140,21 @@ func quarantineVersion(self, version string) {
 	_, _ = f.WriteString(version + "\n")
 }
 
+// isOnProbation reports whether the running binary was just self-updated and has not yet
+// committed as healthy (the probation marker still exists). A privileged one-shot run
+// such as `provision` uses this to avoid acting as root on an unproven build: it defers
+// until the main agent has cleared probation, or rolled back to the known-good binary.
+func isOnProbation() bool {
+	self, err := selfPath()
+	if err != nil {
+		return false
+	}
+	if _, serr := os.Stat(self + updateStateSuffix); serr == nil {
+		return true
+	}
+	return false
+}
+
 // handleUpdateProbation runs at the very start of main. If this binary was just
 // self-updated it is on probation: we count the boot, and if the new build keeps
 // exiting before committing (a crash-looping bad build) we roll back to the kept
