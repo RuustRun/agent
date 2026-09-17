@@ -217,7 +217,14 @@ func (r *Reconciler) build(routes []Route, limits *contract.IngressConfig) (map[
 	}
 
 	cfg := map[string]any{
-		"admin": map[string]any{"listen": "0.0.0.0:2019"},
+		// The admin API MUST stay bound to loopback. The agent reaches it over
+		// http://localhost:2019 (adminURL), and it is UNAUTHENTICATED: anyone who can
+		// reach it has full control of ingress (reroute any Egg hostname, drive TLS,
+		// proxy to loopback-only on-box services). Caddy's /load replaces the admin
+		// listener with whatever this config says, so binding it to 0.0.0.0 here would
+		// silently override the loopback pin set at startup and expose it on the public
+		// interface. Keep it 127.0.0.1.
+		"admin": map[string]any{"listen": "127.0.0.1:2019"},
 		"apps": map[string]any{
 			"tls": map[string]any{
 				"automation": map[string]any{
