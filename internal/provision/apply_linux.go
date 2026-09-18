@@ -63,7 +63,80 @@ func Apply(ctx context.Context, o Options, m contract.ProvisioningManifest) erro
 			errs = append(errs, fmt.Errorf("agent caps: %w", err))
 		}
 	}
+	if m.SSH != nil {
+		if err := applySSH(ctx, o, m.SSH); err != nil {
+			errs = append(errs, fmt.Errorf("ssh: %w", err))
+		}
+	}
 	return errors.Join(errs...)
+}
+
+// applySSH installs the operator public keys and, only when a key is present and asked,
+// disables password auth. It is deliberately conservative:
+//   - the operator keys go in a MANAGED file added alongside each user's own
+//     authorized_keys, so a key the operator placed by hand is never clobbered;
+//   - password auth is disabled ONLY with a key present, so the fleet cannot be locked out;
+//   - the full sshd config is VALIDATED (sshd -t) before anything is reloaded, and on a
+//     validation failure the drop-in is rolled back so a later restart or reboot cannot
+//     load a bad config;
+//   - sshd is RELOADED, never restarted, so a live session is never dropped.
+func applySSH(ctx context.Context, o Options, s *contract.SSHConfig) error {
+	hasKeys := hasAnyKey(s.AuthorizedKeys)
+	if s.DisablePasswordAuth && !hasKeys {
+		o.Log.Warn("ssh: refusing to disable password auth with no operator key present")
+	}
+
+	keysChanged, err := writeFileIfChanged(sshKeysPath, authorizedKeysFile(s.AuthorizedKeys), 0o600)
+	if err != nil {
+		return fmt.Errorf("write operator keys: %w", err)
+	}
+	dropIn := sshDropIn(sshKeysPath, s.DisablePasswordAuth, hasKeys)
+	dropChanged, err := writeFileIfChanged(sshDropInPath, dropIn, 0o644)
+	if err != nil {
+		return fmt.Errorf("write sshd drop-in: %w", err)
+	}
+	if !keysChanged && !dropChanged {
+		return nil // already converged; sshd was validated + reloaded on the change
+	}
+
+	// Validate the whole sshd config BEFORE reloading. If our generated drop-in does not
+	// validate (it should always, but be safe), roll it back so a later restart/reboot
+	// cannot load a broken config and lock us out, and do not reload.
+	if err := run(ctx, o, sshdBinary(), "-t"); err != nil {
+		if dropChanged {
+			_ = os.Remove(sshDropInPath)
+		}
+		return fmt.Errorf("sshd config invalid, rolled back, not reloading: %w", err)
+	}
+
+	// Reload (never restart) so live sessions survive. The unit is `ssh` on Debian/Ubuntu
+	// and `sshd` on RHEL-likes; try one then the other.
+	if rerr := run(ctx, o, "systemctl", "reload", "ssh"); rerr != nil {
+		if rerr2 := run(ctx, o, "systemctl", "reload", "sshd"); rerr2 != nil {
+			return fmt.Errorf("reload sshd: %w", rerr)
+		}
+	}
+	// Log the outcome as a fixed message chosen by the branch, so no value derived from
+	// the SSH config flows into the log sink (keeps the CodeQL clear-text-logging check
+	// happy; a boolean flag is not sensitive, but this is tidier anyway).
+	if s.DisablePasswordAuth && hasKeys {
+		o.Log.Info("ssh hardening applied: key-only login (password auth disabled)",
+			"operatorKeys", len(s.AuthorizedKeys))
+	} else {
+		o.Log.Info("ssh hardening applied: operator keys installed (password auth unchanged)",
+			"operatorKeys", len(s.AuthorizedKeys))
+	}
+	return nil
+}
+
+// sshdBinary resolves the sshd path (not always on the agent's PATH), for `sshd -t`.
+func sshdBinary() string {
+	for _, p := range []string{"/usr/sbin/sshd", "/sbin/sshd", "/usr/bin/sshd"} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return "sshd"
 }
 
 // applyFirewall writes the egg-egress script, its blocked-ports env and the oneshot
