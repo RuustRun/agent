@@ -14,3 +14,7 @@ func Apply(_ context.Context, o Options, _ contract.ProvisioningManifest) error 
 	o.Log.Info("host provisioning is a Linux-only operation; skipping on this platform")
 	return nil
 }
+
+// writeSSHState is a no-op off Linux (probing sshd needs a real host). The main loop's
+// ReportedSSHState then finds no fresh file and reports reconcilerActive=false.
+func writeSSHState(_ Options) error { return nil }

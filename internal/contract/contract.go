@@ -791,12 +791,35 @@ type HostStatus struct {
 	// host that has not probed yet (nil) stays distinct from a real false, and the
 	// control plane can show operators which hosts actually cap disk.
 	QuotaEnforced *bool `json:"quotaEnforced,omitempty"`
+	// SSH is the EFFECTIVE sshd state the root provision reconciler last probed (sshd -T
+	// plus the managed operator-key count), for the console's per-node SSH health badge.
+	// Nil from an agent that predates this. The main (unprivileged) loop cannot run sshd -T
+	// itself, so it reports what the root reconciler wrote; ReconcilerActive is false when no
+	// fresh probe is available (for example a host with no provision reconciler installed).
+	SSH *SSHReport `json:"ssh,omitempty"`
 	// Containers is the health of every container the agent is currently running.
 	Containers []ContainerHealth `json:"containers"`
 	// AgentLogs is the agent's OWN recent log output (a rolling window, not
 	// incremental), so an operator can stream a node's agent logs from the console
 	// without shell access. May be empty. Never contains secrets.
 	AgentLogs []LogLine `json:"agentLogs,omitempty"`
+}
+
+// SSHReport is the effective SSH state of a host, for the operator/customer console badge.
+// PasswordAuthEnabled and OperatorKeyCount are pointers so "not probed" stays distinct from
+// a real value; they are present only when ReconcilerActive is true (a fresh probe exists).
+type SSHReport struct {
+	// PasswordAuthEnabled is the EFFECTIVE `PasswordAuthentication` from `sshd -T` (which
+	// merges all drop-ins, so it catches a cloud-init file re-enabling passwords). Nil when
+	// not probed.
+	PasswordAuthEnabled *bool `json:"passwordAuthEnabled,omitempty"`
+	// OperatorKeyCount is the number of managed operator public keys installed on the host.
+	// Nil when not probed.
+	OperatorKeyCount *int `json:"operatorKeyCount,omitempty"`
+	// ReconcilerActive is true when the root provision reconciler has written a FRESH SSH
+	// probe. False means no recent probe (no reconciler installed, or it is not running), so
+	// the console can flag "SSH health unknown / reconciler not installed".
+	ReconcilerActive bool `json:"reconcilerActive"`
 }
 
 // ProvisioningManifest is the OS-level host state the control plane wants, returned by

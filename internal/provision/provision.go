@@ -63,6 +63,14 @@ func Run(ctx context.Context, o Options) error {
 		return fmt.Errorf("fetching provisioning manifest: %w", err)
 	}
 
+	// Refresh the reported SSH state on EVERY run (cheap, and independent of whether the
+	// manifest changed), so the console badge reflects the box's EFFECTIVE sshd. This
+	// catches drift the manifest cannot, like a cloud-init drop-in re-enabling passwords.
+	// Best effort: never fail provisioning over it.
+	if err := writeSSHState(o); err != nil {
+		o.Log.Warn("could not refresh reported SSH state", "err", err)
+	}
+
 	want := o.AgentVersion + "\n" + m.Generation
 	if have, _ := os.ReadFile(markerPath); strings.TrimSpace(string(have)) == strings.TrimSpace(want) {
 		o.Log.Info("host provisioning already current", "generation", m.Generation)

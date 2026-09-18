@@ -1,8 +1,11 @@
 package provision
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
+	"time"
 )
 
 // SSH hardening rendering, kept OS-independent (no build tag) so it is unit-testable on
@@ -63,4 +66,40 @@ func sshDropIn(keysPath string, disablePassword, hasKeys bool) []byte {
 		b.WriteString("PermitRootLogin prohibit-password\n")
 	}
 	return []byte(b.String())
+}
+
+// sshStatePath is where the ROOT reconciler writes the effective SSH state it probed, for
+// the unprivileged main agent loop to read and report. The main loop cannot run `sshd -T`
+// or read the 0600 operator-key file itself, so it relies on this 0644 summary.
+const sshStatePath = "/var/lib/ruust/ssh-state.json"
+
+// sshStateFreshFor is how long a written probe is trusted. Beyond it (for example the
+// reconciler stopped running) the main loop reports reconcilerActive=false so the console
+// flags the host rather than showing a stale all-clear.
+const sshStateFreshFor = 12 * time.Minute
+
+// sshState is the effective SSH state the root reconciler probes and the main loop reports.
+type sshState struct {
+	PasswordAuthEnabled bool `json:"passwordAuthEnabled"`
+	OperatorKeyCount    int  `json:"operatorKeyCount"`
+}
+
+// ReportedSSHState reads the effective SSH state the root reconciler last wrote. ok is
+// false when there is no fresh probe (no reconciler installed, not run recently, or the
+// file is unreadable/corrupt), which the caller reports as reconcilerActive=false. Pure
+// file read, so it works on any platform (the main agent loop calls it).
+func ReportedSSHState() (passwordAuthEnabled bool, operatorKeyCount int, ok bool) {
+	info, err := os.Stat(sshStatePath)
+	if err != nil || time.Since(info.ModTime()) > sshStateFreshFor {
+		return false, 0, false
+	}
+	b, err := os.ReadFile(sshStatePath)
+	if err != nil {
+		return false, 0, false
+	}
+	var st sshState
+	if err := json.Unmarshal(b, &st); err != nil {
+		return false, 0, false
+	}
+	return st.PasswordAuthEnabled, st.OperatorKeyCount, true
 }
