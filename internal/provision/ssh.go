@@ -14,8 +14,15 @@ import (
 // authorized_keys so we never clobber a key the operator put there by hand.
 const sshKeysPath = "/etc/ruust/ssh/operator_authorized_keys"
 
-// sshDropInPath is our sshd_config drop-in. sshd includes /etc/ssh/sshd_config.d/*.conf.
-const sshDropInPath = "/etc/ssh/sshd_config.d/50-ruust-hardening.conf"
+// sshDropInPath is our sshd_config drop-in. sshd includes /etc/ssh/sshd_config.d/*.conf in
+// lexical order and honours the FIRST value for each keyword, and Ubuntu cloud images ship
+// 50-cloud-init.conf with PasswordAuthentication yes, so our file MUST sort before it
+// (10- < 50-) or our "no" is silently ignored.
+const sshDropInPath = "/etc/ssh/sshd_config.d/10-ruust-hardening.conf"
+
+// oldSSHDropInPath is the pre-ordering-fix filename, retired in applySSH so it cannot
+// linger and confuse a future audit (it was already shadowed by cloud-init anyway).
+const oldSSHDropInPath = "/etc/ssh/sshd_config.d/50-ruust-hardening.conf"
 
 // hasAnyKey reports whether at least one non-blank key is present.
 func hasAnyKey(keys []string) bool {

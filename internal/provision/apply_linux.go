@@ -95,7 +95,16 @@ func applySSH(ctx context.Context, o Options, s *contract.SSHConfig) error {
 	if err != nil {
 		return fmt.Errorf("write sshd drop-in: %w", err)
 	}
-	if !keysChanged && !dropChanged {
+	// Retire the pre-ordering-fix drop-in (50-) if it is still on disk, so only the winning
+	// 10- file is left. Treat its removal as a change so we validate and reload below.
+	oldRemoved := false
+	if _, statErr := os.Stat(oldSSHDropInPath); statErr == nil {
+		if rmErr := os.Remove(oldSSHDropInPath); rmErr != nil {
+			return fmt.Errorf("remove superseded sshd drop-in: %w", rmErr)
+		}
+		oldRemoved = true
+	}
+	if !keysChanged && !dropChanged && !oldRemoved {
 		return nil // already converged; sshd was validated + reloaded on the change
 	}
 
