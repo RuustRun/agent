@@ -5,6 +5,7 @@ package provision
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -146,6 +147,47 @@ func sshdBinary() string {
 		}
 	}
 	return "sshd"
+}
+
+// writeSSHState probes the host's EFFECTIVE sshd state and the managed operator-key count
+// and writes them to sshStatePath, so the unprivileged main agent loop (which cannot run
+// sshd -T or read the 0600 key file) can report them for the console SSH health badge. It
+// uses `sshd -T`, which merges every drop-in, so it reflects what sshd ACTUALLY resolves
+// (catching a cloud-init file that re-enables passwords, not just what we wrote). Root only.
+// Best effort: the caller logs and carries on, so a probe failure never fails provisioning.
+func writeSSHState(o Options) error {
+	out, err := exec.CommandContext(context.Background(), sshdBinary(), "-T").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("sshd -T: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	passwordAuthEnabled := true
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(strings.ToLower(strings.TrimSpace(line)))
+		if len(fields) == 2 && fields[0] == "passwordauthentication" {
+			passwordAuthEnabled = fields[1] == "yes"
+			break
+		}
+	}
+
+	// Count the well-formed managed operator keys (skip the header comment and blanks).
+	keyCount := 0
+	if b, rerr := os.ReadFile(sshKeysPath); rerr == nil {
+		for _, line := range strings.Split(string(b), "\n") {
+			if t := strings.TrimSpace(line); t != "" && !strings.HasPrefix(t, "#") {
+				keyCount++
+			}
+		}
+	}
+
+	data, err := json.Marshal(sshState{PasswordAuthEnabled: passwordAuthEnabled, OperatorKeyCount: keyCount})
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(sshStatePath), 0o755); err != nil {
+		return err
+	}
+	// 0644 so the unprivileged main agent (user ruust) can read it.
+	return os.WriteFile(sshStatePath, append(data, '\n'), 0o644)
 }
 
 // applyFirewall writes the egg-egress script, its blocked-ports env and the oneshot

@@ -60,6 +60,7 @@ import (
 	"github.com/RuustRun/agent/internal/hostcap"
 	"github.com/RuustRun/agent/internal/hostfacts"
 	"github.com/RuustRun/agent/internal/ingress"
+	"github.com/RuustRun/agent/internal/provision"
 	"github.com/RuustRun/agent/internal/reconcile"
 	"github.com/RuustRun/agent/internal/shaping"
 )
@@ -1149,6 +1150,21 @@ func (a *agent) reportStatus(ctx context.Context, appliedVersion string) {
 	if a.cfg.ingressEnabled && a.ingress != nil {
 		ih := a.ingress.Health(ctx)
 		status.Ingress = &ih
+	}
+
+	// Effective SSH state for the console badge. The main loop is unprivileged, so it
+	// cannot run `sshd -T` itself; it reports what the root provision reconciler last wrote.
+	// A fresh probe reports the effective password-auth + key count; no fresh probe (no
+	// reconciler installed, or it stopped) reports reconcilerActive=false so the console can
+	// flag the host rather than show a stale all-clear.
+	if pwAuth, keyCount, ok := provision.ReportedSSHState(); ok {
+		status.SSH = &contract.SSHReport{
+			PasswordAuthEnabled: &pwAuth,
+			OperatorKeyCount:    &keyCount,
+			ReconcilerActive:    true,
+		}
+	} else {
+		status.SSH = &contract.SSHReport{ReconcilerActive: false}
 	}
 
 	body, err := json.Marshal(status)
