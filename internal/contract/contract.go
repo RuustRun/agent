@@ -822,6 +822,21 @@ type ProvisioningManifest struct {
 	// capabilities (CAP_NET_ADMIN/CAP_SYS_ADMIN + the setns syscall) that egress shaping
 	// needs. The reconciler rewrites the unit and restarts the agent only if missing.
 	AgentNetworkCaps bool `json:"agentNetworkCaps,omitempty"`
+	// SSH is the managed-host SSH auth policy (nil = the agent does not touch sshd). The
+	// control plane sends it to MANAGED hosts only, never a BYO host.
+	SSH *SSHConfig `json:"ssh,omitempty"`
+}
+
+// SSHConfig is the managed-host SSH auth policy the agent converges. It installs operator
+// keys in a managed file (never clobbering a user's own authorized_keys) and, only when a
+// key is present, disables password auth. The agent validates sshd and RELOADS it (never
+// restarts), so a change cannot drop a live session or lock the fleet out.
+type SSHConfig struct {
+	// AuthorizedKeys are operator PUBLIC keys to install on the host.
+	AuthorizedKeys []string `json:"authorizedKeys,omitempty"`
+	// DisablePasswordAuth turns password auth off (key-only), applied only when at least
+	// one authorized key is present.
+	DisablePasswordAuth bool `json:"disablePasswordAuth,omitempty"`
 }
 
 // FirewallConfig is the Egg egress firewall policy, applied on top of the static
