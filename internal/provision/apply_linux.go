@@ -36,15 +36,24 @@ const (
 	agentDropInPath = "/etc/systemd/system/ruust-agent.service.d/10-ruust-network-caps.conf"
 )
 
-// The capability drop-in layered onto the agent unit. A drop-in is additive, so it
-// grants the network capabilities and the setns syscall egress shaping needs without
-// rewriting (and risking) the base unit the enrol script wrote.
+// The capability drop-in layered onto the agent unit. It grants the network capabilities
+// and the setns syscall that per-Egg egress shaping (nsenter + tc) needs.
+//
+// SystemCallFilter is an ALLOW-LIST that MERGES (unions) across drop-ins, so a bare
+// "SystemCallFilter=setns" is NOT additive in the intuitive sense: on a base unit that has
+// its own filter (a current enrol) it unions harmlessly, but on an OLDER unit with no
+// filter it becomes the entire allow-list, restricting the agent to ONLY setns and
+// SIGSYS-killing it on the next syscall. So carry the FULL baseline here (matching what
+// enrol writes) plus setns, so the drop-in is safe whether or not the base unit has a
+// filter. British English. No em dashes.
 const agentCapsDropIn = `# Managed by ruust-agent provision. Grants the network capabilities and the setns
-# syscall that per-Egg egress shaping (nsenter + tc) needs. Additive drop-in, so it
-# never clobbers the base unit. British English. No em dashes.
+# syscall that per-Egg egress shaping (nsenter + tc) needs. Carries the full syscall
+# baseline (not a bare setns) so it is safe on a base unit that has no filter of its own.
+# British English. No em dashes.
 [Service]
 AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN
-SystemCallFilter=setns
+SystemCallFilter=@system-service setns
+SystemCallFilter=~@debug @mount @swap @reboot @raw-io @clock @cpu-emulation @obsolete
 `
 
 // Apply converges the host to the manifest. Each step is independent and idempotent;
