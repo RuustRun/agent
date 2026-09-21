@@ -29,9 +29,10 @@
 #
 # FAIL-SAFE by design (a firewall must never be the thing that locks you out):
 #   - Established connections are kept, so applying it cannot drop a live SSH session.
-#   - An EMPTY SSH allowlist leaves SSH OPEN on both families, so a missing list can never lock
-#     the fleet out. A non-empty allowlist that names only one family DENIES SSH on the other,
-#     so an operator can deliberately restrict SSH to specific addresses.
+#   - SSH (22) is allowed ONLY from the allowlist. An EMPTY allowlist denies SSH from everywhere
+#     (matching the console, which lets you add your IP over HTTPS without needing SSH); a
+#     non-empty allowlist that names only one address family denies SSH on the other. This never
+#     drops a LIVE session (established is kept), only new connections from non-allowed sources.
 #   - The default DROP is the LAST rule and the INPUT jump is only kept when the whole
 #     ruleset built cleanly; ANY build error tears the chain down to fully-open (never a
 #     half-built chain with the DROP live) and reports failure so the next poll retries.
@@ -141,11 +142,12 @@ apply() {
   add -p tcp --dport 80 -j ACCEPT
   add -p tcp --dport 443 -j ACCEPT
 
-  # SSH (22). Allow this family's allowlist entries; the other family's entries are handled by
-  # the other binary. If the WHOLE allowlist is empty, leave SSH open on both families so a
-  # missing list can never lock the fleet out. If the allowlist is non-empty but names no entry
-  # for THIS family, SSH is denied over this family (the default DROP below handles it):
-  # restricting SSH to named addresses is deliberate. Established sessions survive regardless.
+  # SSH (22). Allow ONLY this family's allowlist entries; the other family's entries are handled
+  # by the other binary. If there are no entries for this family (an empty list, or an allowlist
+  # that names only the other family), SSH is denied over this family (the default DROP below
+  # handles it). An empty list therefore denies SSH everywhere, matching the console, which lets
+  # an operator add their IP over HTTPS without needing SSH. Established sessions survive
+  # regardless, so this never drops a live connection, only new ones from non-allowed sources.
   local have_any=0 have_fam=0 cidr
   for cidr in $SSH_ALLOWLIST; do
     have_any=1
@@ -161,11 +163,12 @@ apply() {
       fi
     fi
   done
-  if [[ "$have_any" == "0" ]]; then
-    add -p tcp --dport 22 -j ACCEPT
-    log "IPv$fam: SSH allowlist empty, SSH left open from anywhere (fail-open)."
-  elif [[ "$have_fam" == "0" ]]; then
-    log "IPv$fam: no IPv$fam entries in the SSH allowlist, SSH DENIED over IPv$fam (add an IPv$fam CIDR to allow it)."
+  if [[ "$have_fam" == "0" ]]; then
+    if [[ "$have_any" == "0" ]]; then
+      log "IPv$fam: SSH allowlist empty, SSH DENIED (add an IP on the HTTPS console to allow it)."
+    else
+      log "IPv$fam: no IPv$fam entries in the SSH allowlist, SSH DENIED over IPv$fam (add an IPv$fam CIDR to allow it)."
+    fi
   fi
 
   # Operator extras: any additional host-listening TCP ports.
