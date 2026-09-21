@@ -1,0 +1,27 @@
+# ruust-inbound-firewall.service
+#
+# Applies the host inbound firewall (/opt/ruust/firewall/inbound-fw.sh) at boot and, via the
+# provisioning reconciler, whenever the operator changes the policy. Written out by
+# `ruust-agent provision`. Whether it enforces, and the SSH allowlist, are read from
+# /etc/ruust/inbound-firewall.env, which the reconciler renders from the control plane's
+# provisioning manifest (managed hosts only). The reconciler re-applies it on every ~2 minute
+# poll so it self-heals; PartOf=docker.service additionally re-runs it the instant Docker
+# restarts (Docker can rebuild the netfilter tables then), closing that window, matching the
+# egress firewall. British English. No em dashes.
+
+[Unit]
+Description=Ruust host inbound firewall
+Wants=network-online.target
+After=network-online.target
+After=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/ruust/inbound-firewall.env
+ExecStart=/opt/ruust/firewall/inbound-fw.sh
+SyslogIdentifier=ruust-inbound-firewall
+
+[Install]
+WantedBy=multi-user.target

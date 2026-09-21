@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,11 +26,22 @@ var eggEgressScript []byte
 //go:embed assets/ruust-egg-firewall.service
 var eggFirewallUnit []byte
 
+//go:embed assets/inbound-fw.sh
+var inboundFwScript []byte
+
+//go:embed assets/ruust-inbound-firewall.service
+var inboundFwUnit []byte
+
 const (
 	firewallScriptPath = "/opt/ruust/firewall/egg-egress.sh"
 	firewallEnvPath    = "/etc/ruust/egg-firewall.env"
 	firewallUnitPath   = "/etc/systemd/system/ruust-egg-firewall.service"
 	firewallUnitName   = "ruust-egg-firewall.service"
+
+	inboundFwScriptPath = "/opt/ruust/firewall/inbound-fw.sh"
+	inboundFwEnvPath    = "/etc/ruust/inbound-firewall.env"
+	inboundFwUnitPath   = "/etc/systemd/system/ruust-inbound-firewall.service"
+	inboundFwUnitName   = "ruust-inbound-firewall.service"
 
 	agentUnitName   = "ruust-agent.service"
 	agentDropInDir  = "/etc/systemd/system/ruust-agent.service.d"
@@ -64,6 +76,9 @@ func Apply(ctx context.Context, o Options, m contract.ProvisioningManifest) erro
 
 	if err := applyFirewall(ctx, o, m.Firewall); err != nil {
 		errs = append(errs, fmt.Errorf("firewall: %w", err))
+	}
+	if err := applyInboundFirewall(ctx, o, m.Firewall); err != nil {
+		errs = append(errs, fmt.Errorf("inbound firewall: %w", err))
 	}
 	if err := ensurePackages(ctx, o, m.Packages); err != nil {
 		errs = append(errs, fmt.Errorf("packages: %w", err))
@@ -230,6 +245,78 @@ func applyFirewall(ctx context.Context, o Options, fw *contract.FirewallConfig) 
 	}
 	// restart (not just start) so a new blocked-ports list is re-applied on a oneshot.
 	return run(ctx, o, "systemctl", "restart", firewallUnitName)
+}
+
+// applyInboundFirewall writes the inbound (host INPUT default-deny) script, its env and the
+// oneshot unit, then (re)starts it so a changed enforce flag or SSH allowlist takes effect on
+// the next poll. When the manifest carries no inbound block, or enforce is false, the env has
+// RUUST_INBOUND_ENFORCE=0 and the script tears its own chain down, so toggling the policy off
+// restores the open host. The whole block is fail-safe: an empty allowlist leaves SSH open and
+// established connections are always kept, so a change here can never drop the operator's live
+// SSH session or lock the fleet out.
+func applyInboundFirewall(ctx context.Context, o Options, fw *contract.FirewallConfig) error {
+	var enforce bool
+	var allowlist []string
+	var extraPorts []int
+	if fw != nil && fw.Inbound != nil {
+		enforce = fw.Inbound.Enforce
+		allowlist = fw.Inbound.SSHAllowlist
+		extraPorts = fw.Inbound.ExtraAllowTcpPorts
+	}
+	enforceVal := "0"
+	if enforce {
+		enforceVal = "1"
+	}
+	// Validate everything BEFORE it reaches the shell: a single malformed token from the
+	// manifest would make an iptables rule fail, and although the script is built to fail open
+	// (never half-closed) on such an error, a bad entry must not silently disable the whole
+	// policy. Keep only well-formed IPs/CIDRs and in-range ports; drop and log the rest so the
+	// rendered env is always safe to word-split.
+	cleanAllow := make([]string, 0, len(allowlist))
+	for _, a := range allowlist {
+		a = strings.TrimSpace(a)
+		if a == "" {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(a); err == nil {
+			cleanAllow = append(cleanAllow, a)
+		} else if net.ParseIP(a) != nil {
+			cleanAllow = append(cleanAllow, a)
+		} else {
+			o.Log.Warn("inbound firewall: dropping malformed SSH allowlist entry", "entry", a)
+		}
+	}
+	portParts := make([]string, 0, len(extraPorts))
+	for _, p := range extraPorts {
+		if p >= 1 && p <= 65535 {
+			portParts = append(portParts, strconv.Itoa(p))
+		} else {
+			o.Log.Warn("inbound firewall: dropping out-of-range extra TCP port", "port", p)
+		}
+	}
+	// The script reads these as whitespace-separated lists (allowlist CIDRs, extra ports).
+	var env strings.Builder
+	fmt.Fprintf(&env, "RUUST_INBOUND_ENFORCE=%s\n", enforceVal)
+	fmt.Fprintf(&env, "RUUST_SSH_ALLOWLIST=%q\n", strings.Join(cleanAllow, " "))
+	fmt.Fprintf(&env, "RUUST_INBOUND_EXTRA_TCP_PORTS=%q\n", strings.Join(portParts, " "))
+
+	if _, err := writeFileIfChanged(inboundFwScriptPath, inboundFwScript, 0o755); err != nil {
+		return err
+	}
+	if _, err := writeFileIfChanged(inboundFwEnvPath, []byte(env.String()), 0o644); err != nil {
+		return err
+	}
+	if _, err := writeFileIfChanged(inboundFwUnitPath, inboundFwUnit, 0o644); err != nil {
+		return err
+	}
+	if err := run(ctx, o, "systemctl", "daemon-reload"); err != nil {
+		return err
+	}
+	if err := run(ctx, o, "systemctl", "enable", inboundFwUnitName); err != nil {
+		return err
+	}
+	// restart (not just start) so a changed enforce flag or allowlist re-applies on a oneshot.
+	return run(ctx, o, "systemctl", "restart", inboundFwUnitName)
 }
 
 // ensurePackages installs any of the named packages that are not already present. It
