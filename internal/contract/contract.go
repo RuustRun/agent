@@ -869,4 +869,26 @@ type FirewallConfig struct {
 	// direct-to-MX SMTP abuse. 25 by default; submission ports 587/465 stay open for
 	// authenticated relays.
 	BlockedOutboundPorts []int `json:"blockedOutboundPorts"`
+	// Inbound, when present with Enforce true, applies a default-deny host INPUT policy on
+	// top of the egress firewall. Loopback, established/related, ICMP and 80/443 (the public
+	// front door) are always kept; SSH (22) is allowed only from SSHAllowlist; every other
+	// host-destined port is dropped. Docker-published Egg ports travel the FORWARD path and
+	// are never affected. When absent, or Enforce is false, the agent tears its chain down,
+	// so toggling it off restores the open host. Managed hosts only (the control plane never
+	// sends this to a customer's BYO machine).
+	Inbound *InboundFirewall `json:"inbound,omitempty"`
+}
+
+// InboundFirewall is the host INPUT (default-deny) firewall policy.
+type InboundFirewall struct {
+	// Enforce turns the default-deny INPUT policy on. False (or a nil parent) removes it.
+	Enforce bool `json:"enforce"`
+	// SSHAllowlist are CIDRs allowed to reach SSH (port 22). An EMPTY list leaves SSH open
+	// from anywhere (fail-open): a missing allowlist must never lock the fleet out. When it
+	// has entries, SSH is allowed only from those (per address family), and applying the
+	// policy never drops a live session because established connections are always kept.
+	SSHAllowlist []string `json:"sshAllowlist,omitempty"`
+	// ExtraAllowTcpPorts are additional host-listening TCP ports to allow inbound, beyond
+	// 80/443/22. For an operator that runs an extra host service; empty on a standard host.
+	ExtraAllowTcpPorts []int `json:"extraAllowTcpPorts,omitempty"`
 }
