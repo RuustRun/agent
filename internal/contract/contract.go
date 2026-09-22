@@ -518,9 +518,10 @@ type DesiredState struct {
 	// this host on, per architecture, delivered over THIS authenticated channel rather
 	// than beside the binary on the open download path. The agent verifies a self-update
 	// download against this hash and refuses a mismatch, so tampering with the download
-	// endpoint or the transit alone cannot install a substituted binary. Nil for an older
-	// control plane (the agent then falls back to the published .sha256). Outside the
-	// version hash: an update pin must never, by itself, roll a workload.
+	// endpoint or the transit alone cannot install a substituted binary. Pinning is
+	// MANDATORY: with no pin (nil, or no hash for this arch) the agent does NOT self-update,
+	// never trusting a checksum fetched beside the binary. Outside the version hash: an
+	// update pin must never, by itself, roll a workload.
 	AgentUpdate *AgentUpdate `json:"agentUpdate,omitempty"`
 }
 
