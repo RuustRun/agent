@@ -376,25 +376,19 @@ func (a *agent) maybeSelfUpdate(ctx context.Context) {
 		return
 	}
 
-	// Integrity: verify the download against an expected sha256 before we ever chmod +x
-	// and swap it into place. Prefer the hash the control plane PINNED over the
+	// Integrity: verify the download against the sha256 the control plane PINNED over the
 	// authenticated desired-state channel (host-token, TLS), which an attacker on the open
-	// download path cannot have chosen. Only when the control plane serves no pin (an older
-	// build, or a pin/version race) do we fall back to the published .sha256 fetched beside
-	// the binary. Either way, fail closed: no expected hash, no update, so a tampered or
-	// corrupt binary is never exec'd as root.
+	// download path cannot have chosen. Pinning is MANDATORY: with no authenticated pin for
+	// this version and architecture we do NOT update. We never trust a checksum fetched
+	// beside the binary on the open path, so a tampered or corrupt binary is never exec'd as
+	// root. The control plane always pins (it serves no "latest"), so a missing pin means an
+	// older or racing control plane, and holding on the current build is the safe outcome.
 	expected, authenticated := pinnedUpdateHash(a.latestAgentUpdate, target, runtime.GOARCH)
-	if authenticated {
-		a.log.Info("self-update: verifying against the control-plane-pinned hash")
-	} else {
-		h, cerr := a.fetchChecksum(ctx, url+".sha256")
-		if cerr != nil {
-			a.log.Warn("self-update: no pinned hash and could not fetch published checksum, skipping", "err", cerr)
-			return
-		}
-		expected = h
-		a.log.Info("self-update: no pinned hash from the control plane, falling back to the published checksum")
+	if !authenticated {
+		a.log.Warn("self-update: no control-plane-pinned hash for this version/arch, skipping (pinning is mandatory)")
+		return
 	}
+	a.log.Info("self-update: verifying against the control-plane-pinned hash")
 
 	// Write to a temp file in the SAME directory so the rename is atomic on one
 	// filesystem, then swap it into place over the running binary (allowed on Linux
@@ -445,42 +439,6 @@ func (a *agent) maybeSelfUpdate(ctx context.Context) {
 
 	a.log.Info("agent updated, restarting into new build (on probation)", "version", target)
 	os.Exit(0) // systemd (Restart=always) brings it straight back on the new binary.
-}
-
-// fetchChecksum GETs a published sha256 file for the agent binary and returns its
-// hex digest. The body is a bare digest or "sha256sum" style ("<hex>  <name>").
-func (a *agent) fetchChecksum(ctx context.Context, url string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return "", err
-	}
-	res, err := a.http.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = res.Body.Close() }()
-	if res.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("checksum status %d", res.StatusCode)
-	}
-	b, err := io.ReadAll(io.LimitReader(res.Body, 4096))
-	if err != nil {
-		return "", err
-	}
-	return parseSha256(string(b))
-}
-
-// parseSha256 extracts a lower-case 64-hex-char sha256 digest from a checksum file
-// body, rejecting anything that is not exactly one.
-func parseSha256(s string) (string, error) {
-	fields := strings.Fields(s)
-	if len(fields) == 0 {
-		return "", fmt.Errorf("empty checksum")
-	}
-	sum := strings.ToLower(fields[0])
-	if !isHexSha256(sum) {
-		return "", fmt.Errorf("malformed checksum")
-	}
-	return sum, nil
 }
 
 // isHexSha256 reports whether s is exactly 64 lowercase hex characters.
