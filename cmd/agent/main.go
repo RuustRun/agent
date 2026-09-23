@@ -589,7 +589,7 @@ func (a *agent) tick(ctx context.Context) {
 			for _, w := range desired.Workloads {
 				if w.PublishPort > 0 && len(w.Hostnames) > 0 {
 					if ports := portsByWorkload[w.ID]; len(ports) > 0 {
-						routes = append(routes, ingress.Route{Hostnames: w.Hostnames, UpstreamPorts: ports})
+						routes = append(routes, ingress.Route{Hostnames: w.Hostnames, UpstreamPorts: ports, ProxiedHostnames: w.ProxiedHostnames})
 					}
 				}
 			}

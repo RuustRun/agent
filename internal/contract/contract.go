@@ -223,6 +223,11 @@ type WorkloadSpec struct {
 	// domains. The agent registers ingress routes for these and answers the ask
 	// endpoint for them.
 	Hostnames []string `json:"hostnames,omitempty"`
+	// ProxiedHostnames is the subset of Hostnames the customer runs behind a TLS-terminating
+	// proxy (Cloudflare orange-cloud). The agent serves these with Caddy's internal self-signed
+	// cert instead of Let's Encrypt, since ACME cannot complete a challenge through such a proxy
+	// (the customer sets the proxy's SSL mode to "Full"). Always a subset of Hostnames.
+	ProxiedHostnames []string `json:"proxiedHostnames,omitempty"`
 	// Env lists the names of environment variables the workload expects. Only the
 	// keys travel over this contract. Secret values are injected out of band and
 	// are never included here, and are never logged.
