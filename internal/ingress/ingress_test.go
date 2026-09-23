@@ -35,7 +35,7 @@ func TestServerTimeoutSchema(t *testing.T) {
 // silently expose it on the public interface. It must always be 127.0.0.1.
 func TestAdminBindsLoopback(t *testing.T) {
 	r := New("http://localhost:2019", "127.0.0.1", "http://127.0.0.1:9700/ask", false, slog.Default())
-	cfg, _ := r.build([]Route{{Hostnames: []string{"app.example.com"}, UpstreamPorts: []int{32950}}}, nil)
+	cfg, _, _ := r.build([]Route{{Hostnames: []string{"app.example.com"}, UpstreamPorts: []int{32950}}}, nil)
 
 	admin, ok := cfg["admin"].(map[string]any)
 	if !ok {
@@ -65,7 +65,7 @@ func TestDumpCaddyConfig(t *testing.T) {
 		t.Skip("set RUUST_DUMP_CADDY_CONFIG to a path to dump the generated config")
 	}
 	r := New("http://localhost:2019", "127.0.0.1", "http://127.0.0.1:9700/ask", false, slog.Default())
-	cfg, _ := r.build(
+	cfg, _, _ := r.build(
 		[]Route{{Hostnames: []string{"app.example.com"}, UpstreamPorts: []int{32950}}},
 		&contract.IngressConfig{
 			ReadTimeout:  "30s",
@@ -83,4 +83,44 @@ func TestDumpCaddyConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("wrote %d bytes to %s", len(b), out)
+}
+
+// TestProxiedHostnameGetsInternalIssuer checks that a proxied custom domain is served with the
+// internal self-signed CA (so a Cloudflare "Full" proxy in front works), while a direct domain
+// keeps the default (ACME) issuer in production.
+func TestProxiedHostnameGetsInternalIssuer(t *testing.T) {
+	r := New("http://localhost:2019", "127.0.0.1", "http://127.0.0.1:9700/ask", false, slog.Default())
+	cfg, _, proxied := r.build([]Route{{
+		Hostnames:        []string{"direct.example.com", "proxied.example.com"},
+		UpstreamPorts:    []int{32950},
+		ProxiedHostnames: []string{"proxied.example.com"},
+	}}, nil)
+
+	if !proxied["proxied.example.com"] || proxied["direct.example.com"] {
+		t.Fatalf("proxied set = %v, want only proxied.example.com", proxied)
+	}
+
+	policies := cfg["apps"].(map[string]any)["tls"].(map[string]any)["automation"].(map[string]any)["policies"].([]map[string]any)
+	var internalSubjects []string
+	sawDefault := false
+	for _, p := range policies {
+		subs, hasSubs := p["subjects"].([]string)
+		issuers, hasIssuers := p["issuers"].([]map[string]any)
+		if !hasSubs {
+			sawDefault = true
+			if hasIssuers {
+				t.Error("the default policy must not pin an issuer in production (it uses ACME)")
+			}
+			continue
+		}
+		if hasIssuers && issuers[0]["module"] == "internal" {
+			internalSubjects = append(internalSubjects, subs...)
+		}
+	}
+	if !sawDefault {
+		t.Error("missing the default (catch-all) TLS policy")
+	}
+	if len(internalSubjects) != 1 || internalSubjects[0] != "proxied.example.com" {
+		t.Errorf("internal-issuer subjects = %v, want [proxied.example.com]", internalSubjects)
+	}
 }

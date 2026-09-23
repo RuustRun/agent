@@ -41,6 +41,10 @@ import (
 type Route struct {
 	Hostnames     []string
 	UpstreamPorts []int
+	// ProxiedHostnames is the subset of Hostnames served with Caddy's internal self-signed
+	// cert, because the customer fronts them with a TLS-terminating proxy (Cloudflare orange
+	// cloud in "Full" mode) that ACME cannot pass a challenge through.
+	ProxiedHostnames []string
 }
 
 // Reconciler owns the connection to Caddy's admin API and the ask allow-list.
@@ -59,6 +63,7 @@ type Reconciler struct {
 
 	mu       sync.RWMutex
 	allowed  map[string]bool
+	proxied  map[string]bool // hostnames served with the internal cert (behind a proxy)
 	lastHash string
 }
 
@@ -75,13 +80,14 @@ func New(adminURL, upstreamHost, askEndpoint string, localTLS bool, log *slog.Lo
 		http:         &http.Client{},
 		log:          log,
 		allowed:      map[string]bool{},
+		proxied:      map[string]bool{},
 	}
 }
 
 // Reconcile pushes the config for the given routes to Caddy if it has changed,
 // and updates the ask allow-list. A no-change reconcile is a cheap hash compare.
 func (r *Reconciler) Reconcile(ctx context.Context, routes []Route, limits *contract.IngressConfig) error {
-	cfg, allowed := r.build(routes, limits)
+	cfg, allowed, proxied := r.build(routes, limits)
 	body, err := json.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("marshal caddy config: %w", err)
@@ -89,10 +95,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, routes []Route, limits *cont
 	sum := sha256.Sum256(body)
 	hash := hex.EncodeToString(sum[:])
 
-	// The allow-list must always track the latest desired state, even when the
-	// Caddy config itself is unchanged, so update it first.
+	// The allow-list (and the proxied set the cert probe reads) must always track the latest
+	// desired state, even when the Caddy config itself is unchanged, so update them first.
 	r.mu.Lock()
 	r.allowed = allowed
+	r.proxied = proxied
 	unchanged := hash == r.lastHash
 	r.mu.Unlock()
 	if unchanged {
@@ -148,8 +155,9 @@ func (r *Reconciler) AskHandler() http.HandlerFunc {
 // hashes identically and skips the reload. limits applies the operator's ingress
 // hardening (timeouts and a request-body cap); nil (an older control plane) leaves
 // Caddy at its defaults.
-func (r *Reconciler) build(routes []Route, limits *contract.IngressConfig) (map[string]any, map[string]bool) {
+func (r *Reconciler) build(routes []Route, limits *contract.IngressConfig) (map[string]any, map[string]bool, map[string]bool) {
 	allowed := map[string]bool{}
+	proxied := map[string]bool{}
 	httpRoutes := make([]map[string]any, 0, len(routes))
 
 	// Sort routes by their first hostname for a stable config hash.
@@ -180,6 +188,9 @@ func (r *Reconciler) build(routes []Route, limits *contract.IngressConfig) (map[
 		for _, h := range hosts {
 			allowed[h] = true
 		}
+		for _, h := range rt.ProxiedHostnames {
+			proxied[h] = true
+		}
 		proxy := map[string]any{
 			"handler":   "reverse_proxy",
 			"upstreams": upstreams,
@@ -208,13 +219,30 @@ func (r *Reconciler) build(routes []Route, limits *contract.IngressConfig) (map[
 		})
 	}
 
-	// On-demand issuance is gated by the ask endpoint. In production the issuer is
-	// ACME (Let's Encrypt), so Egg hostnames get real, browser-trusted certs; the
-	// internal self-signed CA is used only for a local single-box setup.
-	policy := map[string]any{"on_demand": true}
-	if r.localTLS {
-		policy["issuers"] = []map[string]any{{"module": "internal"}}
+	// On-demand issuance is gated by the ask endpoint. Proxied hostnames get a policy of their
+	// own that uses the INTERNAL self-signed CA: the customer fronts them with a proxy that
+	// terminates public TLS (Cloudflare orange cloud, SSL mode "Full"), which cannot pass the
+	// ACME challenge to this host, so a real Let's Encrypt cert can never issue. The default
+	// policy issues ACME (Let's Encrypt) in production for direct hostnames; the internal CA is
+	// the default only for a local single-box setup.
+	policies := make([]map[string]any, 0, 2)
+	if len(proxied) > 0 {
+		subs := make([]string, 0, len(proxied))
+		for h := range proxied {
+			subs = append(subs, h)
+		}
+		sort.Strings(subs)
+		policies = append(policies, map[string]any{
+			"subjects":  subs,
+			"issuers":   []map[string]any{{"module": "internal"}},
+			"on_demand": true,
+		})
 	}
+	defaultPolicy := map[string]any{"on_demand": true}
+	if r.localTLS {
+		defaultPolicy["issuers"] = []map[string]any{{"module": "internal"}}
+	}
+	policies = append(policies, defaultPolicy)
 
 	cfg := map[string]any{
 		// The admin API MUST stay bound to loopback. The agent reaches it over
@@ -228,7 +256,7 @@ func (r *Reconciler) build(routes []Route, limits *contract.IngressConfig) (map[
 		"apps": map[string]any{
 			"tls": map[string]any{
 				"automation": map[string]any{
-					"policies": []map[string]any{policy},
+					"policies": policies,
 					"on_demand": map[string]any{
 						"permission": map[string]any{"module": "http", "endpoint": r.askEndpoint},
 					},
@@ -241,7 +269,7 @@ func (r *Reconciler) build(routes []Route, limits *contract.IngressConfig) (map[
 			},
 		},
 	}
-	return cfg, allowed
+	return cfg, allowed, proxied
 }
 
 // ruustServer builds the Caddy HTTP server block, applying the operator's timeouts
@@ -360,9 +388,13 @@ func (r *Reconciler) probeCert(ctx context.Context, hostname string) string {
 	if leaf.VerifyHostname(hostname) != nil {
 		return "pending" // the served cert does not (yet) cover this hostname
 	}
-	// In production we expect a real (Let's Encrypt) cert; an internal-CA cert means
-	// on-demand ACME has not issued yet. Locally the internal CA IS the expected issuer.
-	if !r.localTLS && strings.Contains(leaf.Issuer.CommonName, "Caddy Local Authority") {
+	// In production a DIRECT hostname expects a real (Let's Encrypt) cert; an internal-CA cert
+	// means on-demand ACME has not issued yet. A PROXIED hostname (served behind a TLS proxy)
+	// and the local single-box setup both expect the internal CA, so that counts as issued.
+	r.mu.RLock()
+	proxiedHost := r.proxied[hostname]
+	r.mu.RUnlock()
+	if !r.localTLS && !proxiedHost && strings.Contains(leaf.Issuer.CommonName, "Caddy Local Authority") {
 		return "pending"
 	}
 	return "issued"
