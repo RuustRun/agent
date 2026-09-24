@@ -621,8 +621,15 @@ type ContainerHealth struct {
 	State ContainerState `json:"state"`
 	// Healthy reports whether the workload is currently passing its health check.
 	Healthy bool `json:"healthy"`
-	// RestartCount is the number of times the container has been restarted.
+	// RestartCount is the number of crash-restarts the agent has issued for this container
+	// in its current crash episode (reset to zero once it recovers). Docker's own restart
+	// policy is disabled, so this is the agent's count, not Docker's.
 	RestartCount int `json:"restartCount"`
+	// RestartLimited is true when the agent has hit the crash-restart ceiling for this
+	// container and stopped restarting it: the Egg is cracked and will stay stopped until a
+	// redeploy (or an operator) intervenes, rather than bouncing forever. Lets the control
+	// plane tell the customer the Egg is stopped, not still trying. Omitted when false.
+	RestartLimited bool `json:"restartLimited,omitempty"`
 	// Usage is the measured cgroup usage.
 	Usage CgroupUsage `json:"usage"`
 	// DiskBytes is the on-disk usage of the Egg's persistent volume in bytes, for a
@@ -788,6 +795,12 @@ type HostStatus struct {
 	// back from (quarantined). Always sent (even empty, no omitempty) so the control
 	// plane can clear the alert once the node's quarantine is cleared.
 	RolledBack []string `json:"rolledBack"`
+	// RebootError is set when the agent tried to act on an admin reboot request and the
+	// reboot command failed (for example polkit "interactive authentication required" on a
+	// box where the agent is not privileged to reboot). It lets the console show WHY a box
+	// never rebooted instead of the request silently retrying forever. Omitted when the last
+	// reboot attempt succeeded or none was requested.
+	RebootError string `json:"rebootError,omitempty"`
 	// Ingress is the local Caddy ingress health, so the console can show whether the
 	// host's public front door works. Nil on a host with no Caddy (a workload-only host).
 	Ingress *IngressHealth `json:"ingress,omitempty"`

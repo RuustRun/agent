@@ -152,6 +152,9 @@ func main() {
 		ingress:  ingress.New(cfg.caddyAdminURL, cfg.upstreamHost, cfg.askEndpoint, cfg.localTLS, log),
 		builder:  build.New(),
 		importer: dbimport.New(),
+
+		restartLimiter:    reconcile.NewCrashLoopLimiter(reconcile.DefaultMaxCrashRestarts),
+		egressUnshapeable: map[string]bool{},
 	}
 	// The Backuper relays snapshots to and from a Vault through the control-plane
 	// staging endpoints, host-token authorised (see backupUpload/backupDownload).
@@ -248,6 +251,26 @@ type agent struct {
 	// A fresh process after the reboot starts false, and the boot-time check then keeps
 	// it from rebooting again (the request predates the new boot). Single-goroutine loop.
 	rebootIssued bool
+
+	// rebootFailures counts consecutive failed reboot attempts for the CURRENT request, so a
+	// reboot the box cannot perform (for example polkit denies it) is retried a few times and
+	// then abandoned rather than fired on every poll forever. rebootError carries the last
+	// failure to the control plane so an operator can see why the box never rebooted.
+	// rebootHandledAt is the RebootRequestedAt value we last acted on, so a changed request
+	// (cleared, or a fresh timestamp) resets all of this and is retried afresh.
+	// Single-goroutine loop.
+	rebootFailures  int
+	rebootError     string
+	rebootHandledAt string
+
+	// restartLimiter caps how many times a crashed container is restarted before it is left
+	// stopped (cracked), so a hard crash-loop cannot bounce forever and churn its neighbours.
+	restartLimiter *reconcile.CrashLoopLimiter
+
+	// egressUnshapeable records container ids whose netns the agent cannot enter to apply tc
+	// (a host where the agent lacks the privilege), so the failure is logged once per
+	// container rather than on every poll. Pruned when the container is gone.
+	egressUnshapeable map[string]bool
 
 	// latestAgentUpdate is the agent-update pin from the most recent desired-state poll:
 	// the expected binary hash per arch, delivered over the authenticated channel. The
@@ -531,11 +554,18 @@ func (a *agent) tick(ctx context.Context) {
 	// acts on drift, so an unchanged desired state with no drift is a cheap no-op
 	// (a single container list), whilst a missing or unhealthy container is healed
 	// here. This is what makes a hand-killed container come back.
-	plan, cerr := reconcile.Converge(ctx, a.docker, desired)
+	plan, cerr := reconcile.ConvergeGoverned(ctx, a.docker, desired, a.restartLimiter)
 	for _, step := range plan.Steps {
 		// blobId is internal; it is safe in host-side structured logs but must
 		// never be rendered to a customer.
 		a.log.Info("converge step", "action", string(step.Action), "workloadId", step.WorkloadID, "blobId", step.BlobID)
+	}
+	// Log each Egg the crash-loop cap has just given up on, exactly once. It stays stopped
+	// (cracked) until a redeploy rolls it to a fresh container; the status report carries
+	// restartLimited so the control plane can tell the customer it is stopped, not looping.
+	for _, c := range a.restartLimiter.TakeNewlyLimited() {
+		a.log.Warn("crash-restart limit reached, leaving Egg stopped",
+			"workloadId", c.WorkloadID, "blobId", c.BlobID, "restarts", a.restartLimiter.Attempts(c.ID))
 	}
 	if cerr != nil {
 		// Partial failure: do not advance appliedVersion, so the next tick retries.
@@ -635,12 +665,21 @@ func (a *agent) tick(ctx context.Context) {
 // the current boot. Idempotent: once the box has rebooted, its boot time is after the
 // request, so this is a no-op and the control plane clears the flag on the next report.
 func (a *agent) maybeReboot(desired contract.DesiredState) {
-	if desired.RebootRequestedAt == "" || a.rebootIssued {
+	req := desired.RebootRequestedAt
+	// A changed request (cleared, or a fresh timestamp) resets our per-request state so the
+	// new one is retried from scratch and the old failure no longer clings to the report.
+	if req != a.rebootHandledAt {
+		a.rebootHandledAt = req
+		a.rebootIssued = false
+		a.rebootFailures = 0
+		a.rebootError = ""
+	}
+	if req == "" || a.rebootIssued {
 		return
 	}
-	reqAt, err := time.Parse(time.RFC3339, desired.RebootRequestedAt)
+	reqAt, err := time.Parse(time.RFC3339, req)
 	if err != nil {
-		a.log.Warn("ignoring reboot request with unparseable timestamp", "value", desired.RebootRequestedAt)
+		a.log.Warn("ignoring reboot request with unparseable timestamp", "value", req)
 		return
 	}
 	// Boot time on our own clock. If the request predates it, the box has already
@@ -650,15 +689,36 @@ func (a *agent) maybeReboot(desired contract.DesiredState) {
 	if !reqAt.After(bootedAt) {
 		return
 	}
-	a.rebootIssued = true
-	a.log.Warn("reboot requested by control plane, rebooting host", "requestedAt", desired.RebootRequestedAt)
-	// systemctl on a systemd host; the agent runs as root under systemd. The process is
-	// terminated by the reboot, so we do not wait on the result.
-	if out, err := exec.Command("systemctl", "reboot").CombinedOutput(); err != nil {
-		a.log.Error("reboot command failed", "err", err, "out", strings.TrimSpace(string(out)))
-		a.rebootIssued = false // let a later tick retry
+	a.log.Warn("reboot requested by control plane, rebooting host", "requestedAt", req)
+	// systemctl on a systemd host. The process is terminated by a successful reboot, so we
+	// do not wait on the result of a success; a failure returns and we handle it.
+	out, cmdErr := exec.Command("systemctl", "reboot").CombinedOutput()
+	if cmdErr == nil {
+		a.rebootIssued = true // the box is going down; do not fire again.
+		a.rebootError = ""
+		return
+	}
+	// The reboot did not run. The usual cause on a box where the agent is not uid 0 is polkit
+	// "interactive authentication required". Retrying that on every poll forever spams the
+	// journal and never succeeds, so try a few times then give up: report the error, latch
+	// rebootIssued so we stop, and leave it to the control plane to expire the stale request.
+	a.rebootFailures++
+	a.rebootError = strings.TrimSpace(string(out))
+	if a.rebootError == "" {
+		a.rebootError = cmdErr.Error()
+	}
+	a.log.Error("reboot command failed", "err", cmdErr, "out", a.rebootError, "attempt", a.rebootFailures)
+	if a.rebootFailures >= maxRebootAttempts {
+		a.rebootIssued = true // give up: stop retrying this request every poll.
+		a.log.Error("giving up on reboot after repeated failures; control plane will clear the request",
+			"attempts", a.rebootFailures)
 	}
 }
+
+// maxRebootAttempts bounds how many times the agent fires systemctl reboot for one request
+// before abandoning it. A box that cannot reboot (a privilege gap) never succeeds, so a small
+// cap stops the every-poll retry; the control plane also expires the stale request.
+const maxRebootAttempts = 3
 
 // fetchDesiredState performs GET /api/v1/hosts/:id/desired-state. It returns the
 // desired state, whether the version differs from the last applied version, and
@@ -924,6 +984,9 @@ func (a *agent) reconcileEgress(ctx context.Context, hc *contract.HostConfig) {
 		if a.shapedEgress[c.ID] == bps {
 			continue // Already at the desired rate for this exact container.
 		}
+		if a.egressUnshapeable[c.ID] {
+			continue // Known-unshapeable on this host: do not retry or re-log every poll.
+		}
 		var serr error
 		if bps > 0 {
 			serr = shaping.Apply(ctx, c.PID, bps)
@@ -931,6 +994,17 @@ func (a *agent) reconcileEgress(ctx context.Context, hc *contract.HostConfig) {
 			serr = shaping.Clear(ctx, c.PID)
 		}
 		if serr != nil {
+			if isNetnsPermissionError(serr) {
+				// The agent cannot enter this container's netns to run tc (a host where it is
+				// not privileged enough, for example not uid 0 / no CAP_SYS_PTRACE). Retrying
+				// never fixes it, so mark the container and log ONCE rather than on every poll.
+				// The per-Egg rate cap is simply not enforced here until the host is
+				// reprovisioned; abuse accounting and the firewall caps still apply.
+				a.egressUnshapeable[c.ID] = true
+				a.log.Warn("egress shaping unavailable on this host (cannot enter container netns); per-Egg rate cap not enforced",
+					"workloadId", c.WorkloadID, "err", serr)
+				continue
+			}
 			a.log.Warn("egress shaping failed", "workloadId", c.WorkloadID, "bytesPerSecond", bps, "err", serr)
 			continue
 		}
@@ -942,6 +1016,22 @@ func (a *agent) reconcileEgress(ctx context.Context, hc *contract.HostConfig) {
 			delete(a.shapedEgress, id)
 		}
 	}
+	for id := range a.egressUnshapeable {
+		if !seen[id] {
+			delete(a.egressUnshapeable, id)
+		}
+	}
+}
+
+// isNetnsPermissionError reports whether an egress-shaping error is the host-privilege kind
+// (the agent cannot enter the container netns), which will not resolve on retry, as opposed
+// to a transient tc failure worth retrying next poll.
+func isNetnsPermissionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "permission denied") || strings.Contains(s, "operation not permitted")
 }
 
 // reportStatus performs POST /api/v1/hosts/:id/status with per-container health,
@@ -984,14 +1074,15 @@ func (a *agent) reportStatus(ctx context.Context, appliedVersion string) {
 		// it was not re-measured; omitted from the JSON so it never clobbers the last
 		// known figure on the control plane.
 		health = append(health, contract.ContainerHealth{
-			WorkloadID:   c.WorkloadID,
-			BlobID:       c.BlobID,
-			State:        c.State,
-			Healthy:      c.Healthy,
-			RestartCount: c.RestartCount,
-			Usage:        usage,
-			DiskBytes:    a.measureDisk(ctx, c.ID),
-			Logs:         logs,
+			WorkloadID:     c.WorkloadID,
+			BlobID:         c.BlobID,
+			State:          c.State,
+			Healthy:        c.Healthy,
+			RestartCount:   a.restartLimiter.Attempts(c.ID),
+			RestartLimited: a.restartLimiter.Limited(c.ID),
+			Usage:          usage,
+			DiskBytes:      a.measureDisk(ctx, c.ID),
+			Logs:           logs,
 		})
 	}
 
@@ -1095,6 +1186,7 @@ func (a *agent) reportStatus(ctx context.Context, appliedVersion string) {
 		RebootRequired:  facts.RebootRequired,
 		UptimeSeconds:   facts.UptimeSeconds,
 		RolledBack:      quarantinedList(),
+		RebootError:     a.rebootError,
 		Containers:      health,
 		AgentLogs:       a.logs.snapshot(),
 		// Whether this host can hard-enforce per-volume disk quotas (xfs + prjquota).
