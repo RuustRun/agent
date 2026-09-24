@@ -308,14 +308,10 @@ func Apply(ctx context.Context, cli docker.Client, desired contract.DesiredState
 
 // Converge is the full diff-then-apply cycle: list actual containers, compute
 // the plan and apply it. It returns the plan (for logging) and any converge
-// errors.
+// errors. It is ConvergeGoverned with no crash-loop cap; the agent uses the
+// governed form so a hard crash-loop is eventually left stopped.
 func Converge(ctx context.Context, cli docker.Client, desired contract.DesiredState) (Plan, error) {
-	actual, err := cli.List(ctx)
-	if err != nil {
-		return Plan{}, fmt.Errorf("listing actual state: %w", err)
-	}
-	plan := Diff(desired, actual)
-	return plan, Apply(ctx, cli, desired, plan)
+	return ConvergeGoverned(ctx, cli, desired, nil)
 }
 
 // joinErrors combines a slice of errors into one, or nil if empty. Kept local
