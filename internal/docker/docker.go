@@ -557,6 +557,36 @@ func (e *engineClient) Create(ctx context.Context, spec contract.WorkloadSpec, v
 		})
 	}
 
+	// Writable scratch (tmpfs) for a runtime that must write inside its own tree
+	// whilst the root filesystem stays read-only: a Next.js prerender cache is the
+	// usual case, and without it every revalidate fails with EROFS and caching is
+	// silently lost.
+	//
+	// RAM backed and wiped on restart, which is what a cache should be. Mode 1777 so
+	// an app running as a non-root user can write there. The size counts against the
+	// container's memory limit; the control plane bounds the total against the Egg's
+	// size before sending it, so an oversized cache is refused rather than arriving
+	// as an OOM.
+	//
+	// The daemon adds nosuid, nodev and noexec to a tmpfs mount itself, so a writable
+	// path cannot become a way to execute something new inside the container. Verified
+	// on this API (type=tmpfs via Mounts): the mount lands as
+	// `rw,nosuid,nodev,noexec,relatime,size=...` and the root filesystem stays
+	// read-only. There is no field on TmpfsOptions to set those flags ourselves.
+	for _, t := range spec.Tmpfs {
+		if t.Path == "" || t.SizeMb <= 0 {
+			continue
+		}
+		hostConfig.Mounts = append(hostConfig.Mounts, mount.Mount{
+			Type:   mount.TypeTmpfs,
+			Target: t.Path,
+			TmpfsOptions: &mount.TmpfsOptions{
+				SizeBytes: int64(t.SizeMb) * int64(units.MiB),
+				Mode:      01777,
+			},
+		})
+	}
+
 	// Publish the container port to a host port when the desired state asks for it
 	// (PublishPort > 0 marks a web Egg; a database Egg has none), so the local
 	// ingress (Caddy) can reach the Egg. The host port is left for Docker to assign

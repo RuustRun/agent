@@ -272,6 +272,11 @@ type WorkloadSpec struct {
 	// Each survives container recreation, so the data outlives a redeploy or
 	// restart. Empty for stateless (web) Eggs.
 	Volumes []VolumeMount `json:"volumes,omitempty"`
+	// Tmpfs are writable scratch mounts, for an Egg whose runtime must write inside
+	// its own tree despite the read-only root filesystem (a Next.js prerender cache
+	// is the usual case). Each is RAM backed, size capped and wiped on restart.
+	// Empty for an Egg that declares none, which is the default.
+	Tmpfs []TmpfsMount `json:"tmpfs,omitempty"`
 	// Migration, when set, is a database Egg migration in flight this host has a part
 	// in (source: snapshot + upload; target: download + restore). Nil for a normal
 	// workload. See MigrationDirective.
@@ -455,6 +460,20 @@ type VolumeMount struct {
 	// SizeGb is the billed allocation. Advisory to the agent for now (the local
 	// volume driver does not hard-enforce a quota).
 	SizeGb int `json:"sizeGb,omitempty"`
+}
+
+// TmpfsMount is one writable scratch mount. It is RAM backed, so its size counts
+// against the container's own memory limit; the control plane bounds the total
+// against the Egg's size before it ever reaches here.
+//
+// Deliberately not a volume: a cache must not make a stateless Egg stateful, because
+// a host-local volume would pin it to one box and break the free re-placement that
+// drain and dead-host recovery rely on.
+type TmpfsMount struct {
+	// Path is the absolute mount point inside the container.
+	Path string `json:"path"`
+	// SizeMb caps the mount. Zero means the entry is ignored.
+	SizeMb int `json:"sizeMb"`
 }
 
 // WorkloadSecrets is the decrypted env for one workload, from the secrets
