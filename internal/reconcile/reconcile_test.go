@@ -210,11 +210,13 @@ func TestStatefulRollStopsBeforeStart(t *testing.T) {
 func TestDiff(t *testing.T) {
 	const version = "v-abc"
 
-	crashed := running("crash", "nginx:latest", version)
+	// crashed and unhealthy are UP TO DATE (their per-workload spec version matches), so the
+	// diff restarts them in place rather than rolling them.
+	crashed := running("crash", "nginx:latest", specVersion(spec("crash", 1, "nginx:latest")))
 	crashed.State = contract.StateCrashed
 	crashed.Healthy = false
 
-	unhealthy := running("sick", "nginx:latest", version)
+	unhealthy := running("sick", "nginx:latest", specVersion(spec("sick", 1, "nginx:latest")))
 	unhealthy.Healthy = false
 
 	cases := []struct {
@@ -239,7 +241,7 @@ func TestDiff(t *testing.T) {
 			desired: contract.DesiredState{HostID: "h1", Version: version, Workloads: []contract.WorkloadSpec{
 				spec("a", 1, "nginx:latest"),
 			}},
-			actual: []docker.Container{running("a", "nginx:latest", version)},
+			actual: []docker.Container{running("a", "nginx:latest", specVersion(spec("a", 1, "nginx:latest")))},
 		},
 		{
 			name:     "stop extra",
@@ -319,6 +321,9 @@ func TestDiff(t *testing.T) {
 // the old ones serving until the new ones are healthy).
 func TestReplicaScaling(t *testing.T) {
 	const version = "v-1"
+	// The per-workload spec version for the "a" workload. specVersion excludes Replicas, so
+	// this is the same whether the desired count is 1 or 3: scaling must not roll survivors.
+	av := specVersion(spec("a", 1, "nginx:latest"))
 
 	legacy := running("a", "nginx:latest", version)
 	legacy.Legacy = true // pre-replica-index container
@@ -337,7 +342,7 @@ func TestReplicaScaling(t *testing.T) {
 			desired: contract.DesiredState{HostID: "h1", Version: version, Workloads: []contract.WorkloadSpec{
 				spec("a", 3, "nginx:latest"),
 			}},
-			actual:    []docker.Container{runningReplica("a", "nginx:latest", version, 0)},
+			actual:    []docker.Container{runningReplica("a", "nginx:latest", av, 0)},
 			wantStart: 2,
 		},
 		{
@@ -346,9 +351,9 @@ func TestReplicaScaling(t *testing.T) {
 				spec("a", 3, "nginx:latest"),
 			}},
 			actual: []docker.Container{
-				runningReplica("a", "nginx:latest", version, 0),
-				runningReplica("a", "nginx:latest", version, 1),
-				runningReplica("a", "nginx:latest", version, 2),
+				runningReplica("a", "nginx:latest", av, 0),
+				runningReplica("a", "nginx:latest", av, 1),
+				runningReplica("a", "nginx:latest", av, 2),
 			},
 		},
 		{
@@ -357,9 +362,9 @@ func TestReplicaScaling(t *testing.T) {
 				spec("a", 1, "nginx:latest"),
 			}},
 			actual: []docker.Container{
-				runningReplica("a", "nginx:latest", version, 0),
-				runningReplica("a", "nginx:latest", version, 1),
-				runningReplica("a", "nginx:latest", version, 2),
+				runningReplica("a", "nginx:latest", av, 0),
+				runningReplica("a", "nginx:latest", av, 1),
+				runningReplica("a", "nginx:latest", av, 2),
 			},
 			wantStop: 2,
 		},
@@ -415,13 +420,16 @@ func TestZeroDowntimeRoll(t *testing.T) {
 	const oldV, newV = "v-old", "v-new"
 	w := spec("a", 1, "nginx:latest")
 
+	// The new containers carry the workload's current per-workload spec version, so the diff
+	// treats them as up to date; the old one carries a different version and is drained.
+	newV2 := specVersion(w)
 	oldHealthy := runningVersion("a", "nginx:latest", oldV, 0)
 
-	newBooting := runningVersion("a", "nginx:latest", newV, 0)
+	newBooting := runningVersion("a", "nginx:latest", newV2, 0)
 	newBooting.State = contract.StateStarting
 	newBooting.Healthy = false
 
-	newHealthy := runningVersion("a", "nginx:latest", newV, 0)
+	newHealthy := runningVersion("a", "nginx:latest", newV2, 0)
 
 	desired := contract.DesiredState{HostID: "h1", Version: newV, Workloads: []contract.WorkloadSpec{w}}
 
@@ -563,8 +571,9 @@ func TestConvergeRollIsZeroDowntime(t *testing.T) {
 	if len(fake.containers) != 1 {
 		t.Errorf("after the roll exactly one container should remain, have %d", len(fake.containers))
 	}
+	webVer := specVersion(spec("web", 1, "nginx:latest"))
 	for _, c := range fake.containers {
-		if c.SpecVersion != newV {
+		if c.SpecVersion != webVer {
 			t.Errorf("the surviving container should be the new version, got %s", c.SpecVersion)
 		}
 	}
@@ -628,5 +637,41 @@ func TestDiff_KeepsSingleOldContainerDuringRoll(t *testing.T) {
 	}
 	if got := countActions(plan, ActionStart); got != 1 {
 		t.Errorf("expected the new container to start, got %d (plan: %+v)", got, plan.Steps)
+	}
+}
+
+// TestOneWorkloadChangeLeavesOthersUntouched is the whole point of per-workload versioning:
+// redeploying one Egg (an app) must NOT roll a co-located, unchanged Egg (its database). The
+// old whole-host version stamping rolled every container on the host whenever anything
+// changed, which dropped every open database connection on each app deploy.
+func TestOneWorkloadChangeLeavesOthersUntouched(t *testing.T) {
+	app := spec("app", 1, "myapp:v1")
+	db := spec("db", 1, "postgres:16")
+	db.Volumes = []contract.VolumeMount{{Name: "ruust-vol-blob-db", Path: "/var/lib/postgresql/data"}}
+
+	// Both currently up to date and healthy.
+	appC := running("app", "myapp:v1", specVersion(app))
+	dbC := running("db", "postgres:16", specVersion(db))
+
+	// The app is redeployed to a new image; the database spec is unchanged. The whole-host
+	// Version changes (as it always would), but that must no longer matter.
+	appV2 := spec("app", 1, "myapp:v2")
+	desired := contract.DesiredState{
+		HostID:    "h1",
+		Version:   "host-version-moved",
+		Workloads: []contract.WorkloadSpec{appV2, db},
+	}
+
+	plan := Diff(desired, []docker.Container{appC, dbC})
+
+	// The database must not be touched at all: no stop, roll, restart or start.
+	for _, s := range plan.Steps {
+		if s.WorkloadID == "db" {
+			t.Errorf("the database must be untouched when only the app changed, got %q on db (plan: %+v)", s.Action, plan.Steps)
+		}
+	}
+	// The app does roll onto its new image (start new, old kept serving until healthy).
+	if got := countActions(plan, ActionStart); got != 1 {
+		t.Errorf("the app should start its new image, got %d starts (plan: %+v)", got, plan.Steps)
 	}
 }
