@@ -11,6 +11,9 @@ package reconcile
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 
 	"github.com/RuustRun/agent/internal/contract"
@@ -131,7 +134,7 @@ func Diff(desired contract.DesiredState, actual []docker.Container) Plan {
 			for _, c := range bySlot[idx] {
 				// Legacy (pre-replica-index) and stale (wrong image or version)
 				// containers are "old": kept running until a fresh one is healthy.
-				if c.Legacy || isStale(w, c, desired.Version) {
+				if c.Legacy || isStale(w, c, specVersion(w)) {
 					old = append(old, c)
 				} else {
 					upToDate = append(upToDate, c)
@@ -244,6 +247,44 @@ func isStale(w contract.WorkloadSpec, c docker.Container, version string) bool {
 	return false
 }
 
+// specVersion is a stable per-workload hash of the fields that define a workload's running
+// container. A container is stamped with this and rolled only when its OWN spec changes.
+//
+// It deliberately does NOT use the whole-host desired.Version. That version is a coarse "did
+// anything on this host change" gate; using it to stamp containers meant that changing ONE
+// workload (an app deploy, a domain edit, anything) moved the host version and so marked
+// EVERY container on the host stale, rolling them all, including a co-located database, which
+// dropped every open connection to it. Hashing per workload means an app redeploy rolls only
+// that app and leaves its database untouched.
+//
+// This is an EXCLUDE list, not an include list, on purpose: a field added to WorkloadSpec in
+// future rolls the container by default (the safe choice, since a new field usually changes
+// what runs), and we only carve out the ones that must NOT roll it:
+//   - Replicas: the slot count. Diff scales by starting/stopping slots; the survivors keep
+//     running, so a scale up or down must not roll them.
+//   - Hostnames / ProxiedHostnames: ingress routing only. The agent reconfigures Caddy live
+//     each tick, so adding or removing a domain must not recreate the container.
+//   - Migration / Import / Backup / DeploymentID: one-shot directives and reporting, matching
+//     the control plane's computeVersion. They drive handlers, not the container's identity.
+func specVersion(w contract.WorkloadSpec) string {
+	c := w
+	c.Replicas = 0
+	c.Hostnames = nil
+	c.ProxiedHostnames = nil
+	c.Migration = nil
+	c.Import = nil
+	c.Backup = nil
+	c.DeploymentID = ""
+	b, err := json.Marshal(c)
+	if err != nil {
+		// Marshalling a plain struct does not fail in practice; fall back to the image ref so
+		// a workload still rolls on an image change even if this ever did.
+		return w.ImageRef
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])[:16]
+}
+
 // needsRestart reports whether a still-desired container should be restarted in
 // place because it has crashed (a cracked Egg) or is failing its health check.
 func needsRestart(c docker.Container) bool {
@@ -291,7 +332,7 @@ func Apply(ctx context.Context, cli docker.Client, desired contract.DesiredState
 			if !ok {
 				continue
 			}
-			if _, err := cli.Create(ctx, spec, desired.Version, step.ReplicaIndex); err != nil {
+			if _, err := cli.Create(ctx, spec, specVersion(spec), step.ReplicaIndex); err != nil {
 				errs = append(errs, fmt.Errorf("start %s replica %d: %w", step.WorkloadID, step.ReplicaIndex, err))
 			}
 		case ActionRestart:
