@@ -159,7 +159,9 @@ type Container struct {
 type Client interface {
 	// List returns every container carrying our label prefix, running or not.
 	List(ctx context.Context) ([]Container, error)
-	// EnsureImage pulls the image if it is not already present. Idempotent.
+	// EnsureImage makes the image available locally. Idempotent. A digest-pinned ref
+	// is pulled once and never again; a mutable TAG is re-checked, so a tag that has
+	// moved upstream is picked up rather than served from a stale local copy.
 	EnsureImage(ctx context.Context, imageRef string) error
 	// Create creates and starts the given replica of a workload with hard limits on
 	// every axis. It is idempotent by (workload, replica) identity: if a matching
@@ -299,13 +301,37 @@ func (e *engineClient) List(ctx context.Context) ([]Container, error) {
 	return out, nil
 }
 
+// pinnedByDigest reports whether a ref names an exact image rather than a tag.
+// repo@sha256:... can never change, so it is safe to serve from the local copy
+// forever; repo:tag can, and routinely does.
+func pinnedByDigest(imageRef string) bool {
+	at := strings.LastIndex(imageRef, "@")
+	return at > 0 && strings.Contains(imageRef[at+1:], ":")
+}
+
 func (e *engineClient) EnsureImage(ctx context.Context, imageRef string) error {
-	// A cheap presence check first keeps steady-state polls quiet.
-	if _, _, err := e.cli.ImageInspectWithRaw(ctx, imageRef); err == nil {
+	_, _, inspectErr := e.cli.ImageInspectWithRaw(ctx, imageRef)
+	havePresent := inspectErr == nil
+
+	// A digest-pinned ref is immutable, so presence is proof of currency and a pull
+	// would be pure waste on every converge.
+	if havePresent && pinnedByDigest(imageRef) {
 		return nil
 	}
+
+	// A TAG is mutable. Presence used to end the matter here, which meant a host that
+	// pulled ghcr.io/ruustrun/postgres:16 months ago kept running those bytes however
+	// many times the tag had been rebuilt since: upstream security patches reached the
+	// registry and stopped there. Docker only transfers layers it does not already
+	// have, so re-checking a tag that has not moved costs one manifest request.
 	rc, err := e.cli.ImagePull(ctx, imageRef, types.ImagePullOptions{})
 	if err != nil {
+		// A registry that is unreachable, rate limiting or refusing auth must never
+		// take out a host that already has a usable copy. Carry on with what we have
+		// and let the next converge try again.
+		if havePresent {
+			return nil
+		}
 		return fmt.Errorf("pulling image %q: %w", imageRef, err)
 	}
 	defer func() { _ = rc.Close() }()
