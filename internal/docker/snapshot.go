@@ -128,6 +128,39 @@ func (e *engineClient) SnapshotPostgres(ctx context.Context, containerID string,
 		pgEnv(env), nil, w)
 }
 
+// postgresDataDir is where a Postgres image of this version expects its volume.
+//
+// The 18+ images changed convention: a single mount belongs at /var/lib/postgresql and
+// the server writes into a major-version subdirectory beneath it, so pg_upgrade --link
+// works without crossing a mount boundary. Given the pre-18 path an 18 image refuses to
+// start, reporting data in "/var/lib/postgresql/data (unused mount/volume)".
+// See docker-library/postgres#1259.
+//
+// The version is only in the image tag, so it is read back from there. The last colon
+// is compared against the last slash because a registry may carry a port and that colon
+// is not a tag separator, the same trap pinnedByDigest has to avoid.
+//
+// Anything unparseable keeps the legacy path on purpose. These containers are brought
+// up against an EXISTING volume, so guessing wrong does not just fail: it would hand a
+// restore an empty directory and look like success.
+func postgresDataDir(image string) string {
+	const legacy = "/var/lib/postgresql/data"
+	ref := image
+	if at := strings.LastIndex(ref, "@"); at > 0 {
+		ref = ref[:at] // digest-pinned: the tag, if any, is before the @
+	}
+	colon := strings.LastIndex(ref, ":")
+	slash := strings.LastIndex(ref, "/")
+	if colon <= slash {
+		return legacy
+	}
+	major, err := strconv.Atoi(strings.SplitN(ref[colon+1:], ".", 2)[0])
+	if err != nil || major < 18 {
+		return legacy
+	}
+	return "/var/lib/postgresql"
+}
+
 // RestorePostgres brings up a fresh Postgres against the target volume (the entrypoint
 // runs initdb and creates POSTGRES_DB), waits until it is genuinely ready, then
 // pg_restores the dump read from r into it. Returns the restored container's id (left
@@ -152,7 +185,7 @@ func (e *engineClient) RestorePostgres(
 	hostCfg := &container.HostConfig{
 		NetworkMode:   container.NetworkMode(EggNetwork),
 		RestartPolicy: container.RestartPolicy{Name: container.RestartPolicyDisabled},
-		Mounts:        []mount.Mount{{Type: mount.TypeVolume, Source: volumeName, Target: "/var/lib/postgresql/data"}},
+		Mounts:        []mount.Mount{{Type: mount.TypeVolume, Source: volumeName, Target: postgresDataDir(image)}},
 	}
 	created, err := e.cli.ContainerCreate(ctx, cfg, hostCfg, nil, nil, name)
 	if err != nil {
@@ -372,7 +405,7 @@ func (e *engineClient) restorePostgresIsolated(ctx context.Context, name, volume
 		&container.HostConfig{
 			NetworkMode:   "none",
 			RestartPolicy: container.RestartPolicy{Name: container.RestartPolicyDisabled},
-			Mounts:        []mount.Mount{{Type: mount.TypeVolume, Source: volumeName, Target: "/var/lib/postgresql/data"}},
+			Mounts:        []mount.Mount{{Type: mount.TypeVolume, Source: volumeName, Target: postgresDataDir(image)}},
 		}, nil, nil, name)
 	if err != nil {
 		return "", fmt.Errorf("creating restore container: %w", err)
