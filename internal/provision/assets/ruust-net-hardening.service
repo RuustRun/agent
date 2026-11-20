@@ -1,0 +1,24 @@
+# ruust-net-hardening.service
+#
+# Applies kernel network hardening (/opt/ruust/firewall/net-harden.sh) at boot and, via the
+# provisioning reconciler, whenever the operator changes the policy. The switches are read
+# from /etc/ruust/net-hardening.env, which the reconciler renders from the control plane's
+# provisioning manifest (managed hosts only). PartOf=docker.service re-runs it when Docker
+# restarts, since Docker can rebuild the netfilter tables then. British English. No em dashes.
+
+[Unit]
+Description=Ruust kernel network hardening
+Wants=network-online.target
+After=network-online.target
+After=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/ruust/net-hardening.env
+ExecStart=/opt/ruust/firewall/net-harden.sh
+SyslogIdentifier=ruust-net-hardening
+
+[Install]
+WantedBy=multi-user.target

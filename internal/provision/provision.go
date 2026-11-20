@@ -123,3 +123,20 @@ func fetchManifest(ctx context.Context, o Options) (contract.ProvisioningManifes
 	}
 	return m, nil
 }
+
+// netHardeningEnv renders the switches for net-harden.sh. A nil policy turns every
+// switch off, which makes the script remove whatever it installed.
+func netHardeningEnv(nh *contract.NetHardening) string {
+	flag := func(b bool) string {
+		if b {
+			return "1"
+		}
+		return "0"
+	}
+	var drop, mptcp, sctp bool
+	if nh != nil {
+		drop, mptcp, sctp = nh.DropTCPIPOptions, nh.DisableMPTCP, nh.BlockSCTP
+	}
+	return fmt.Sprintf("RUUST_DROP_TCP_IP_OPTIONS=%s\nRUUST_DISABLE_MPTCP=%s\nRUUST_BLOCK_SCTP=%s\n",
+		flag(drop), flag(mptcp), flag(sctp))
+}

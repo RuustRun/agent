@@ -32,6 +32,12 @@ var inboundFwScript []byte
 //go:embed assets/ruust-inbound-firewall.service
 var inboundFwUnit []byte
 
+//go:embed assets/net-harden.sh
+var netHardenScript []byte
+
+//go:embed assets/ruust-net-hardening.service
+var netHardenUnit []byte
+
 const (
 	firewallScriptPath = "/opt/ruust/firewall/egg-egress.sh"
 	firewallEnvPath    = "/etc/ruust/egg-firewall.env"
@@ -42,6 +48,11 @@ const (
 	inboundFwEnvPath    = "/etc/ruust/inbound-firewall.env"
 	inboundFwUnitPath   = "/etc/systemd/system/ruust-inbound-firewall.service"
 	inboundFwUnitName   = "ruust-inbound-firewall.service"
+
+	netHardenScriptPath = "/opt/ruust/firewall/net-harden.sh"
+	netHardenEnvPath    = "/etc/ruust/net-hardening.env"
+	netHardenUnitPath   = "/etc/systemd/system/ruust-net-hardening.service"
+	netHardenUnitName   = "ruust-net-hardening.service"
 
 	agentUnitName   = "ruust-agent.service"
 	agentDropInDir  = "/etc/systemd/system/ruust-agent.service.d"
@@ -93,7 +104,61 @@ func Apply(ctx context.Context, o Options, m contract.ProvisioningManifest) erro
 			errs = append(errs, fmt.Errorf("ssh: %w", err))
 		}
 	}
+	if err := applyNetHardening(ctx, o, m.NetHardening); err != nil {
+		errs = append(errs, fmt.Errorf("net hardening: %w", err))
+	}
 	return errors.Join(errs...)
+}
+
+// The Go services on a host that open public or local listeners. Go 1.24+ asks for
+// multipath TCP by default; this drop-in tells them not to, from their next start.
+var noMPTCPDropIns = []string{
+	"/etc/systemd/system/ruust-agent.service.d/20-ruust-no-mptcp.conf",
+	"/etc/systemd/system/caddy.service.d/20-ruust-no-mptcp.conf",
+}
+
+const noMPTCPDropIn = `# Managed by ruust-agent provision. Go 1.24+ requests multipath TCP for listeners by
+# default; keep this service on plain TCP. British English. No em dashes.
+[Service]
+Environment=GODEBUG=multipathtcp=0
+`
+
+// applyNetHardening writes the hardening script, its env and the oneshot unit, then
+// (re)starts it so a changed switch takes effect now. It also lays down (or removes) the
+// no-MPTCP drop-ins for the agent and Caddy. Those are deliberately NOT restarted here: a
+// Caddy restart reloads its bootstrap config and would leave every Egg dark until the
+// agent re-pushed routes, so they pick the setting up at their next natural start (the
+// kernel update reboot). The IP options rule protects the listeners in the meantime.
+func applyNetHardening(ctx context.Context, o Options, nh *contract.NetHardening) error {
+	if _, err := writeFileIfChanged(netHardenScriptPath, netHardenScript, 0o755); err != nil {
+		return err
+	}
+	if _, err := writeFileIfChanged(netHardenEnvPath, []byte(netHardeningEnv(nh)), 0o644); err != nil {
+		return err
+	}
+	if _, err := writeFileIfChanged(netHardenUnitPath, netHardenUnit, 0o644); err != nil {
+		return err
+	}
+
+	wantDropIns := nh != nil && nh.DisableMPTCP
+	for _, path := range noMPTCPDropIns {
+		if wantDropIns {
+			if _, err := writeFileIfChanged(path, []byte(noMPTCPDropIn), 0o644); err != nil {
+				return err
+			}
+		} else if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+
+	if err := run(ctx, o, "systemctl", "daemon-reload"); err != nil {
+		return err
+	}
+	if err := run(ctx, o, "systemctl", "enable", netHardenUnitName); err != nil {
+		return err
+	}
+	// restart (not just start) so a changed switch re-applies on a oneshot.
+	return run(ctx, o, "systemctl", "restart", netHardenUnitName)
 }
 
 // applySSH installs the operator public keys and, only when a key is present and asked,
