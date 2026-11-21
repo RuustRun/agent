@@ -886,6 +886,25 @@ type ProvisioningManifest struct {
 	// SSH is the managed-host SSH auth policy (nil = the agent does not touch sshd). The
 	// control plane sends it to MANAGED hosts only, never a BYO host.
 	SSH *SSHConfig `json:"ssh,omitempty"`
+	// NetHardening is kernel network hardening the host converges (nil = the agent does
+	// not touch it). The control plane sends it to MANAGED hosts only, never a BYO host.
+	NetHardening *NetHardening `json:"netHardening,omitempty"`
+}
+
+// NetHardening narrows the kernel network surface reachable from the internet. Each
+// switch is independent and reversible: turning one off removes what it installed.
+type NetHardening struct {
+	// DropTCPIPOptions drops inbound IPv4 TCP packets that carry IP options, before they
+	// reach the TCP stack (raw PREROUTING, so host and container listeners alike).
+	// Legitimate internet TCP never sets IP options.
+	DropTCPIPOptions bool `json:"dropTcpIpOptions,omitempty"`
+	// DisableMPTCP turns multipath TCP off (sysctl, persisted) and tells the host's Go
+	// services (the agent, Caddy) not to request it. Listeners already open keep their
+	// type until the service next restarts.
+	DisableMPTCP bool `json:"disableMptcp,omitempty"`
+	// BlockSCTP stops the SCTP kernel module from loading. Nothing on a Ruust host uses
+	// SCTP, so this only removes attack surface reachable from inside a container.
+	BlockSCTP bool `json:"blockSctp,omitempty"`
 }
 
 // SSHConfig is the managed-host SSH auth policy the agent converges. It installs operator
