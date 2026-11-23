@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"testing"
+	"time"
 
 	"github.com/RuustRun/agent/internal/contract"
 	"github.com/RuustRun/agent/internal/docker"
@@ -12,7 +13,7 @@ func crashed(id string) docker.Container {
 }
 
 func TestCrashLoopLimiterCapsThenLeavesStopped(t *testing.T) {
-	lim := NewCrashLoopLimiter(3)
+	lim := NewCrashLoopLimiter(3, 0)
 	c := crashed("abc")
 	for i := 1; i <= 3; i++ {
 		lim.Observe([]docker.Container{c})
@@ -41,7 +42,7 @@ func TestCrashLoopLimiterCapsThenLeavesStopped(t *testing.T) {
 }
 
 func TestCrashLoopLimiterResetsWhenRecovered(t *testing.T) {
-	lim := NewCrashLoopLimiter(2)
+	lim := NewCrashLoopLimiter(2, 0)
 	c := crashed("abc")
 	lim.Observe([]docker.Container{c})
 	lim.AllowRestart(c)
@@ -61,7 +62,7 @@ func TestCrashLoopLimiterResetsWhenRecovered(t *testing.T) {
 }
 
 func TestCrashLoopLimiterForgetsGoneContainers(t *testing.T) {
-	lim := NewCrashLoopLimiter(2)
+	lim := NewCrashLoopLimiter(2, 0)
 	c := crashed("abc")
 	lim.Observe([]docker.Container{c})
 	lim.AllowRestart(c)
@@ -72,7 +73,7 @@ func TestCrashLoopLimiterForgetsGoneContainers(t *testing.T) {
 }
 
 func TestCrashLoopLimiterDisabled(t *testing.T) {
-	lim := NewCrashLoopLimiter(0) // 0 disables the cap
+	lim := NewCrashLoopLimiter(0, 0) // 0 disables the cap
 	c := crashed("abc")
 	for i := 0; i < 50; i++ {
 		if !lim.AllowRestart(c) {
@@ -82,7 +83,7 @@ func TestCrashLoopLimiterDisabled(t *testing.T) {
 }
 
 func TestLimitRestartsDropsCappedSteps(t *testing.T) {
-	lim := NewCrashLoopLimiter(1)
+	lim := NewCrashLoopLimiter(1, 0)
 	c := crashed("abc")
 	actual := []docker.Container{c}
 	plan := Plan{Steps: []Step{{Action: ActionRestart, WorkloadID: "w-abc", ContainerID: "abc"}}}
@@ -98,7 +99,7 @@ func TestLimitRestartsDropsCappedSteps(t *testing.T) {
 }
 
 func TestLimitRestartsLeavesOtherActions(t *testing.T) {
-	lim := NewCrashLoopLimiter(0) // even disabled, non-restart steps pass through untouched
+	lim := NewCrashLoopLimiter(0, 0) // even disabled, non-restart steps pass through untouched
 	actual := []docker.Container{crashed("abc")}
 	plan := Plan{Steps: []Step{
 		{Action: ActionStop, WorkloadID: "w1", ContainerID: "x"},
@@ -108,5 +109,36 @@ func TestLimitRestartsLeavesOtherActions(t *testing.T) {
 	got := limitRestarts(plan, actual, lim)
 	if len(got.Steps) != 3 {
 		t.Fatalf("non-restart steps must be preserved, got %d", len(got.Steps))
+	}
+}
+
+func TestCrashLoopLimiterRetriesOncePerCooldown(t *testing.T) {
+	lim := NewCrashLoopLimiter(2, 5*time.Minute)
+	clock := time.Date(2026, 11, 23, 13, 50, 0, 0, time.UTC)
+	lim.now = func() time.Time { return clock }
+	c := crashed("abc")
+	lim.AllowRestart(c)
+	lim.AllowRestart(c)
+	if lim.AllowRestart(c) {
+		t.Fatal("attempt beyond the cap must be refused")
+	}
+	clock = clock.Add(4 * time.Minute)
+	if lim.AllowRestart(c) {
+		t.Fatal("a limited container must not be retried before its cooldown")
+	}
+	clock = clock.Add(time.Minute)
+	if !lim.AllowRestart(c) {
+		t.Fatal("a limited container must be retried once its cooldown has passed")
+	}
+	if lim.AllowRestart(c) {
+		t.Fatal("only one retry per cooldown")
+	}
+	if !lim.Limited(c.ID) {
+		t.Fatal("a slow-cadence container is still reported as restart-limited")
+	}
+	// It comes up (its database is back): the budget resets in full.
+	lim.Observe([]docker.Container{{ID: "abc", State: contract.StateRunning, Healthy: true}})
+	if lim.Limited(c.ID) || lim.Attempts(c.ID) != 0 {
+		t.Fatal("a recovered container must leave the slow cadence")
 	}
 }

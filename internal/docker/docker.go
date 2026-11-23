@@ -536,6 +536,13 @@ func (e *engineClient) Create(ctx context.Context, spec contract.WorkloadSpec, v
 		Env:    env,
 		Labels: labels,
 	}
+	// A database Egg (it has a persistent volume) gets a longer window to shut down
+	// cleanly when stopped, by us or by the daemon at host shutdown (which waits for the
+	// longest container stop timeout). Ten seconds, the default, can cut Postgres off
+	// mid-checkpoint and leave it to crash recovery on the next start.
+	if len(spec.Volumes) > 0 {
+		config.StopTimeout = intptr(statefulStopTimeout)
+	}
 
 	hostConfig := &container.HostConfig{
 		// The Egg joins its chosen network: the shared isolated bridge by default,
@@ -910,7 +917,20 @@ func (e *engineClient) TakeReleaseReports() map[string]*contract.ReleaseReport {
 	return out
 }
 
+// statefulStopTimeout is how long (seconds) a database container is given to shut down
+// cleanly before it is killed.
+const statefulStopTimeout = 60
+
+// Stop shuts a container down cleanly, then removes it. The engine's stop signal and the
+// container's own stop timeout apply (statefulStopTimeout for a database, the daemon
+// default otherwise), so Postgres gets a proper shutdown rather than the SIGKILL a forced
+// remove sends, which left every database resize, restart or redeploy to crash recovery.
+// A stop failure falls through to the forced remove so a wedged container is never
+// stranded. Idempotent: a missing container is success.
 func (e *engineClient) Stop(ctx context.Context, id string) error {
+	if err := e.cli.ContainerStop(ctx, id, container.StopOptions{}); err != nil && client.IsErrNotFound(err) {
+		return nil
+	}
 	err := e.cli.ContainerRemove(ctx, id, container.RemoveOptions{Force: true})
 	if err != nil && !client.IsErrNotFound(err) {
 		return fmt.Errorf("removing container %q: %w", id, err)
@@ -1315,3 +1335,5 @@ func cgroupPathFor(info types.ContainerJSON) string {
 
 // int64ptr is a tiny helper for the SDK fields that take a *int64.
 func int64ptr(v int64) *int64 { return &v }
+
+func intptr(v int) *int { return &v }

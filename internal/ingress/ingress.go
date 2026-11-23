@@ -39,7 +39,10 @@ import (
 // and survives a single replica dying. The upstream host (how Caddy reaches those
 // ports) is configured on the Reconciler.
 type Route struct {
-	Hostnames     []string
+	Hostnames []string
+	// UpstreamPorts are the healthy replicas' host ports. Empty means the Egg has no
+	// healthy replica right now (booting, crashed, stopped): its hostnames are answered
+	// with a holding page instead of being dropped from ingress.
 	UpstreamPorts []int
 	// ProxiedHostnames is the subset of Hostnames served with Caddy's internal self-signed
 	// cert, because the customer fronts them with a TLS-terminating proxy (Cloudflare orange
@@ -65,7 +68,18 @@ type Reconciler struct {
 	allowed  map[string]bool
 	proxied  map[string]bool // hostnames served with the internal cert (behind a proxy)
 	lastHash string
+	// lastVerified is when we last confirmed Caddy still holds our config (see Reconcile).
+	lastVerified time.Time
 }
+
+// serverID tags our HTTP server in the pushed config so we can ask Caddy whether it still
+// has it. A Caddy that restarted on its own loads its bootstrap config, which has no such
+// object, and would otherwise serve nothing until our desired state next changed.
+const serverID = "ruust-ingress"
+
+// configCheckInterval bounds how often an unchanged reconcile asks Caddy whether it still
+// holds our config. One cheap loopback GET at most this often.
+const configCheckInterval = 30 * time.Second
 
 // New builds a Reconciler. adminURL is the Caddy admin API base; upstreamHost is
 // how Caddy dials Egg containers; askEndpoint is the URL (reachable from Caddy)
@@ -101,9 +115,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, routes []Route, limits *cont
 	r.allowed = allowed
 	r.proxied = proxied
 	unchanged := hash == r.lastHash
+	due := time.Since(r.lastVerified) >= configCheckInterval
 	r.mu.Unlock()
 	if unchanged {
-		return nil
+		if !due {
+			return nil
+		}
+		// Our last push is only still live if Caddy has not restarted since. If it has, it is
+		// running its bootstrap config and serving no Egg, so push again. When Caddy cannot be
+		// asked (admin down) there is nothing to push to yet; the next check retries.
+		present, err := r.configPresent(ctx)
+		r.mu.Lock()
+		r.lastVerified = time.Now()
+		r.mu.Unlock()
+		if err != nil || present {
+			return nil
+		}
+		r.log.Warn("ingress config missing from caddy, re-pushing (caddy restarted?)")
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.adminURL+"/load", bytes.NewReader(body))
@@ -123,6 +151,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, routes []Route, limits *cont
 
 	r.mu.Lock()
 	r.lastHash = hash
+	r.lastVerified = time.Now()
 	r.mu.Unlock()
 	r.log.Info("ingress reconciled", "routes", len(routes), "hostnames", len(allowed))
 	return nil
@@ -175,14 +204,6 @@ func (r *Reconciler) build(routes []Route, limits *contract.IngressConfig) (map[
 				ports = append(ports, p)
 			}
 		}
-		if len(ports) == 0 {
-			continue
-		}
-		sort.Ints(ports)
-		upstreams := make([]map[string]any, 0, len(ports))
-		for _, p := range ports {
-			upstreams = append(upstreams, map[string]any{"dial": fmt.Sprintf("%s:%d", r.upstreamHost, p)})
-		}
 		hosts := append([]string(nil), rt.Hostnames...)
 		sort.Strings(hosts)
 		for _, h := range hosts {
@@ -190,6 +211,21 @@ func (r *Reconciler) build(routes []Route, limits *contract.IngressConfig) (map[
 		}
 		for _, h := range rt.ProxiedHostnames {
 			proxied[h] = true
+		}
+		if len(ports) == 0 {
+			// No healthy replica: keep serving TLS for the hostnames (so the certificate
+			// stays issued and a fronting proxy gets a real answer, not a handshake failure)
+			// and say plainly that the site is briefly unavailable.
+			httpRoutes = append(httpRoutes, map[string]any{
+				"match":  []map[string]any{{"host": hosts}},
+				"handle": []map[string]any{holdingPage()},
+			})
+			continue
+		}
+		sort.Ints(ports)
+		upstreams := make([]map[string]any, 0, len(ports))
+		for _, p := range ports {
+			upstreams = append(upstreams, map[string]any{"dial": fmt.Sprintf("%s:%d", r.upstreamHost, p)})
 		}
 		proxy := map[string]any{
 			"handler":   "reverse_proxy",
@@ -278,6 +314,7 @@ func (r *Reconciler) build(routes []Route, limits *contract.IngressConfig) (map[
 // timeout at Caddy's default.
 func ruustServer(httpRoutes []map[string]any, limits *contract.IngressConfig) map[string]any {
 	server := map[string]any{
+		"@id":    serverID,
 		"listen": []string{":443"},
 		"routes": httpRoutes,
 	}
@@ -334,6 +371,29 @@ func (r *Reconciler) Health(ctx context.Context) contract.IngressHealth {
 		h.Certs = append(h.Certs, contract.CertStatusReport{Hostname: hn, Status: r.probeCert(ctx, hn)})
 	}
 	return h
+}
+
+// configPresent asks Caddy whether it still holds our pushed config, by the server's @id.
+// An error means Caddy could not be asked (or answered oddly), not that the config is gone.
+func (r *Reconciler) configPresent(ctx context.Context) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.adminURL+"/id/"+serverID, nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := r.http.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	switch {
+	case resp.StatusCode < 300:
+		return true, nil
+	case resp.StatusCode == http.StatusNotFound:
+		return false, nil
+	default:
+		return false, fmt.Errorf("caddy id lookup returned %d", resp.StatusCode)
+	}
 }
 
 // adminReachable is true when Caddy's admin API answers, which also proves our last
@@ -398,4 +458,32 @@ func (r *Reconciler) probeCert(ctx context.Context, hostname string) string {
 		return "pending"
 	}
 	return "issued"
+}
+
+// holdingPageHTML is what a visitor sees while an Egg has no healthy replica. It belongs to
+// the customer's site, not to us, so it is unbranded and says only what is true: the site
+// is briefly unavailable and will be back.
+const holdingPageHTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Back shortly</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;font:16px/1.5 system-ui,sans-serif;color:#222;background:#fafafa}
+main{max-width:28rem;padding:2rem;text-align:center}h1{font-size:1.4rem;margin:0 0 .5rem}p{margin:0;color:#555}
+@media (prefers-color-scheme:dark){body{color:#eee;background:#151515}p{color:#aaa}}</style>
+</head><body><main><h1>Back shortly</h1><p>This site is temporarily unavailable. Please try again in a minute or two.</p></main></body></html>
+`
+
+// holdingPage is the Caddy handler for an Egg with no healthy replica: a 503 with
+// Retry-After, never cached, so a proxy or browser picks the real site up again the
+// moment it is back.
+func holdingPage() map[string]any {
+	return map[string]any{
+		"handler":     "static_response",
+		"status_code": 503,
+		"headers": map[string][]string{
+			"Content-Type":  {"text/html; charset=utf-8"},
+			"Cache-Control": {"no-store"},
+			"Retry-After":   {"30"},
+		},
+		"body": holdingPageHTML,
+	}
 }

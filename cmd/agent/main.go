@@ -153,7 +153,7 @@ func main() {
 		builder:  build.New(),
 		importer: dbimport.New(),
 
-		restartLimiter:    reconcile.NewCrashLoopLimiter(reconcile.DefaultMaxCrashRestarts),
+		restartLimiter:    reconcile.NewCrashLoopLimiter(reconcile.DefaultMaxCrashRestarts, reconcile.DefaultCrashCooldown),
 		egressUnshapeable: map[string]bool{},
 	}
 	// The Backuper relays snapshots to and from a Vault through the control-plane
@@ -560,11 +560,12 @@ func (a *agent) tick(ctx context.Context) {
 		// never be rendered to a customer.
 		a.log.Info("converge step", "action", string(step.Action), "workloadId", step.WorkloadID, "blobId", step.BlobID)
 	}
-	// Log each Egg the crash-loop cap has just given up on, exactly once. It stays stopped
-	// (cracked) until a redeploy rolls it to a fresh container; the status report carries
-	// restartLimited so the control plane can tell the customer it is stopped, not looping.
+	// Log each Egg the crash-loop cap has just slowed down, exactly once. It stays cracked and
+	// is retried once per cooldown until it comes up (or a redeploy rolls it to a fresh
+	// container); the status report carries restartLimited so the control plane can tell the
+	// customer it is no longer restarting on every tick.
 	for _, c := range a.restartLimiter.TakeNewlyLimited() {
-		a.log.Warn("crash-restart limit reached, leaving Egg stopped",
+		a.log.Warn("crash-restart limit reached, retrying Egg on the slow cadence",
 			"workloadId", c.WorkloadID, "blobId", c.BlobID, "restarts", a.restartLimiter.Attempts(c.ID))
 	}
 	if cerr != nil {
@@ -618,9 +619,10 @@ func (a *agent) tick(ctx context.Context) {
 			routes := make([]ingress.Route, 0, len(desired.Workloads))
 			for _, w := range desired.Workloads {
 				if w.PublishPort > 0 && len(w.Hostnames) > 0 {
-					if ports := portsByWorkload[w.ID]; len(ports) > 0 {
-						routes = append(routes, ingress.Route{Hostnames: w.Hostnames, UpstreamPorts: ports, ProxiedHostnames: w.ProxiedHostnames})
-					}
+					// An Egg with no healthy replica keeps its route with no upstreams, so
+					// ingress answers its hostnames with a holding page (503) rather than
+					// refusing the TLS handshake (which a fronting Cloudflare shows as 525).
+					routes = append(routes, ingress.Route{Hostnames: w.Hostnames, UpstreamPorts: portsByWorkload[w.ID], ProxiedHostnames: w.ProxiedHostnames})
 				}
 			}
 			// Honour the customer ingress toggle: an explicit false tears the routes down

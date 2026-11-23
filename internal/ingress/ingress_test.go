@@ -66,7 +66,10 @@ func TestDumpCaddyConfig(t *testing.T) {
 	}
 	r := New("http://localhost:2019", "127.0.0.1", "http://127.0.0.1:9700/ask", false, slog.Default())
 	cfg, _, _ := r.build(
-		[]Route{{Hostnames: []string{"app.example.com"}, UpstreamPorts: []int{32950}}},
+		[]Route{
+			{Hostnames: []string{"app.example.com"}, UpstreamPorts: []int{32950}},
+			{Hostnames: []string{"down.example.com"}},
+		},
 		&contract.IngressConfig{
 			ReadTimeout:  "30s",
 			IdleTimeout:  "120s",
@@ -122,5 +125,41 @@ func TestProxiedHostnameGetsInternalIssuer(t *testing.T) {
 	}
 	if len(internalSubjects) != 1 || internalSubjects[0] != "proxied.example.com" {
 		t.Errorf("internal-issuer subjects = %v, want [proxied.example.com]", internalSubjects)
+	}
+}
+
+// TestUnhealthyEggServesHoldingPage checks that an Egg with no healthy replica keeps its
+// hostnames (so TLS still completes and the certificate stays allowed) and is answered with
+// a 503 holding page, instead of vanishing from ingress (which a fronting Cloudflare shows as
+// a 525 handshake failure).
+func TestUnhealthyEggServesHoldingPage(t *testing.T) {
+	r := New("http://localhost:2019", "127.0.0.1", "http://127.0.0.1:9700/ask", false, slog.Default())
+	cfg, allowed, _ := r.build([]Route{
+		{Hostnames: []string{"up.example.com"}, UpstreamPorts: []int{32950}},
+		{Hostnames: []string{"down.example.com"}},
+	}, nil)
+	if !allowed["down.example.com"] || !allowed["up.example.com"] {
+		t.Fatalf("both hostnames must stay allowed a certificate, got %v", allowed)
+	}
+	server := cfg["apps"].(map[string]any)["http"].(map[string]any)["servers"].(map[string]any)["ruust"].(map[string]any)
+	if server["@id"] != serverID {
+		t.Fatalf("server must carry @id %q so a Caddy restart can be detected", serverID)
+	}
+	routes := server["routes"].([]map[string]any)
+	if len(routes) != 2 {
+		t.Fatalf("want 2 routes, got %d", len(routes))
+	}
+	var down map[string]any
+	for _, rt := range routes {
+		if rt["match"].([]map[string]any)[0]["host"].([]string)[0] == "down.example.com" {
+			down = rt
+		}
+	}
+	if down == nil {
+		t.Fatal("the unhealthy Egg must keep a route")
+	}
+	h := down["handle"].([]map[string]any)[0]
+	if h["handler"] != "static_response" || h["status_code"] != 503 {
+		t.Fatalf("unhealthy route must answer 503 static_response, got %v", h)
 	}
 }
