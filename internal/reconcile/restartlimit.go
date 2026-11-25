@@ -2,9 +2,12 @@
 // (see needsRestart), which is right for a transient fault but wrong for an Egg that can
 // never come up: it bounces forever, and each bounce takes its neighbours' shared resources
 // (and, for a database Egg, risks an unclean shutdown every cycle). So we cap the number of
-// crash-restarts and then leave the Egg stopped (cracked) until an operator or a fresh
-// deploy intervenes. A redeploy rolls the workload to a new container id, which the limiter
-// has never seen, so the new build gets a full budget: the cap never wedges a good deploy.
+// fast crash-restarts, then slow right down: one retry per cool-down instead of one per
+// converge. It never gives up for good, because the commonest cause of a crash-loop is a
+// dependency that is briefly away (a database Egg being resized or restarted takes a few
+// minutes), and an Egg that stopped trying would stay down after its database came back,
+// until someone noticed and redeployed it. A redeploy rolls the workload to a new container
+// id, which the limiter has never seen, so the new build gets a full budget.
 //
 // The limiter is stateful and lives on the agent (one per process). It is deliberately kept
 // out of the pure Diff so that stays trivially testable; ConvergeGoverned threads it in.
@@ -15,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/RuustRun/agent/internal/contract"
 	"github.com/RuustRun/agent/internal/docker"
@@ -25,6 +29,11 @@ import (
 // dependency that was briefly unreachable) whilst bounding a hard crash-loop to a couple of
 // minutes at the ~10-15s poll cadence.
 const DefaultMaxCrashRestarts = 10
+
+// DefaultCrashCooldown is how often a container past the cap is retried. Slow enough that a
+// genuinely broken Egg costs its neighbours next to nothing, quick enough that one waiting
+// on a dependency is back within minutes of it returning.
+const DefaultCrashCooldown = 5 * time.Minute
 
 // RestartLimiter decides whether a crashed container may be restarted again. Observe is
 // called once per converge with the full container list so the limiter can reset a
@@ -38,25 +47,33 @@ type RestartLimiter interface {
 // CrashLoopLimiter is the default RestartLimiter: an in-memory per-container attempt count
 // with a hard ceiling. Safe for concurrent use (the shell and egress goroutines never touch
 // it, but the interface is small enough to keep honest). A container that reaches the ceiling
-// is "given up on" and stays so until Observe sees it healthy (recovered) or gone (rolled).
+// is "limited": retried once per cooldown, until Observe sees it healthy (recovered) or gone
+// (rolled).
 type CrashLoopLimiter struct {
-	max int
+	max      int
+	cooldown time.Duration
+	now      func() time.Time
 
-	mu       sync.Mutex
-	attempts map[string]int  // containerID -> crash-restarts issued this episode
-	limited  map[string]bool // containerID -> ceiling reached, now left stopped
+	mu        sync.Mutex
+	attempts  map[string]int       // containerID -> crash-restarts issued this episode
+	limited   map[string]bool      // containerID -> ceiling reached, now on the slow cadence
+	lastRetry map[string]time.Time // containerID -> when a limited container was last retried
 	// newlyLimited accumulates containers that JUST hit the ceiling, so the caller can log
 	// the give-up exactly once. Drained by TakeNewlyLimited.
 	newlyLimited []docker.Container
 }
 
-// NewCrashLoopLimiter returns a limiter capping crash-restarts at max. A max <= 0 disables
-// the cap (AllowRestart always allows), which keeps the old unbounded behaviour available.
-func NewCrashLoopLimiter(max int) *CrashLoopLimiter {
+// NewCrashLoopLimiter returns a limiter capping fast crash-restarts at max, then retrying
+// once per cooldown. A max <= 0 disables the cap (AllowRestart always allows), which keeps
+// the old unbounded behaviour available. A cooldown <= 0 never retries past the cap.
+func NewCrashLoopLimiter(max int, cooldown time.Duration) *CrashLoopLimiter {
 	return &CrashLoopLimiter{
-		max:      max,
-		attempts: map[string]int{},
-		limited:  map[string]bool{},
+		max:       max,
+		cooldown:  cooldown,
+		now:       time.Now,
+		attempts:  map[string]int{},
+		limited:   map[string]bool{},
+		lastRetry: map[string]time.Time{},
 	}
 }
 
@@ -72,6 +89,7 @@ func (l *CrashLoopLimiter) Observe(actual []docker.Container) {
 		if c.State == contract.StateRunning && c.Healthy {
 			delete(l.attempts, c.ID)
 			delete(l.limited, c.ID)
+			delete(l.lastRetry, c.ID)
 		}
 	}
 	for id := range l.attempts {
@@ -82,25 +100,34 @@ func (l *CrashLoopLimiter) Observe(actual []docker.Container) {
 	for id := range l.limited {
 		if !present[id] {
 			delete(l.limited, id)
+			delete(l.lastRetry, id)
 		}
 	}
 }
 
-// AllowRestart reports whether this crashed container may be restarted again, counting the
-// attempt. Once the ceiling is passed it returns false for good (until Observe clears the
-// container), and records the container the first time so the give-up can be logged once.
+// AllowRestart reports whether this crashed container may be restarted now, counting the
+// attempt. Once the ceiling is passed the container is limited: refused, except for one
+// retry per cooldown (until Observe clears it). The container is recorded the first time it
+// hits the ceiling so the slow-down can be logged once.
 func (l *CrashLoopLimiter) AllowRestart(c docker.Container) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.max <= 0 {
 		return true // cap disabled
 	}
+	now := l.now()
 	if l.limited[c.ID] {
+		if l.cooldown > 0 && now.Sub(l.lastRetry[c.ID]) >= l.cooldown {
+			l.lastRetry[c.ID] = now
+			l.attempts[c.ID]++
+			return true
+		}
 		return false
 	}
 	l.attempts[c.ID]++
 	if l.attempts[c.ID] > l.max {
 		l.limited[c.ID] = true
+		l.lastRetry[c.ID] = now
 		l.newlyLimited = append(l.newlyLimited, c)
 		return false
 	}

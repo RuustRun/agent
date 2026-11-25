@@ -645,9 +645,10 @@ type ContainerHealth struct {
 	// policy is disabled, so this is the agent's count, not Docker's.
 	RestartCount int `json:"restartCount"`
 	// RestartLimited is true when the agent has hit the crash-restart ceiling for this
-	// container and stopped restarting it: the Egg is cracked and will stay stopped until a
-	// redeploy (or an operator) intervenes, rather than bouncing forever. Lets the control
-	// plane tell the customer the Egg is stopped, not still trying. Omitted when false.
+	// container: the Egg is cracked and no longer restarted on every tick, only retried
+	// once per cooldown (minutes), so it comes back by itself if the fault was a dependency
+	// that has since returned. Lets the control plane tell the customer it is not bouncing
+	// constantly. Omitted when false.
 	RestartLimited bool `json:"restartLimited,omitempty"`
 	// Usage is the measured cgroup usage.
 	Usage CgroupUsage `json:"usage"`
